@@ -18,3 +18,9 @@
 __pycache__
 .DS_Store
 imgui.ini
+
+/colmap.db
+/colmap_sparse
+/colmap_text
+/data/nerf/lego
+/data/nerf/test
