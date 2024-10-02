@@ -414,7 +414,7 @@ if (NGP_BUILD_EXECUTABLE)
 	endif()
 endif(NGP_BUILD_EXECUTABLE)
 
-if (NGP_BUILD_WITH_PYTHON_BINDINGS AND Python_FOUND)
+if (Python_FOUND AND NGP_BUILD_WITH_PYTHON_BINDINGS)
 	add_library(pyngp SHARED src/python_api.cu)
 	set_target_properties(pyngp PROPERTIES CXX_VISIBILITY_PRESET "hidden" CUDA_VISIBILITY_PRESET "hidden")
 	target_link_libraries(pyngp PRIVATE ngp PUBLIC ${PYTHON_LIBRARIES} pybind11::module)
