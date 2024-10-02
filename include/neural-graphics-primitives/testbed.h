@@ -42,6 +42,8 @@
 
 #include <thread>
 
+#include <cuda.h>
+
 struct GLFWwindow;
 
 namespace tcnn {
@@ -613,7 +615,8 @@ public:
 	OpenXRHMD::FrameInfoPtr m_vr_frame_info;
 	bool m_vr_use_depth_reproject = false;
 	bool m_vr_use_hidden_area_mask = true;
-
+#endif
+#if 1
 	void set_n_views(size_t n_views);
 
 	std::function<bool()> m_keyboard_event_callback;

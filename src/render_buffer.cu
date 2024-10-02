@@ -29,6 +29,13 @@
 #  endif
 #  include <GLFW/glfw3.h>
 #  include <cuda_gl_interop.h>
+#else
+#  ifdef _WIN32
+#    include <GL/gl3w.h>
+#  else
+#    include <GL/glew.h>
+#  endif
+#  include <cuda_gl_interop.h>
 #endif
 
 #include <stb_image/stb_image.h>
@@ -80,7 +87,7 @@ void CudaSurface2D::resize(const ivec2& size, int n_channels) {
 	m_n_channels = n_channels;
 }
 
-#ifdef NGP_GUI
+#if defined(NGP_GUI) || 1
 GLTexture::~GLTexture() {
 	m_cuda_mapping.reset();
 	if (m_texture_id) {

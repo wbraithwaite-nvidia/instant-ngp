@@ -71,7 +71,7 @@ private:
 	cudaSurfaceObject_t m_surface;
 };
 
-#ifdef NGP_GUI
+#if defined(NGP_GUI) || 1
 class GLTexture : public SurfaceProvider {
 public:
 	GLTexture() = default;

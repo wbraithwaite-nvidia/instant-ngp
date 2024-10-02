@@ -76,6 +76,7 @@ else()
 	list(APPEND CUDA_NVCC_FLAGS "-Xcompiler=-Wno-float-conversion")
 	list(APPEND CUDA_NVCC_FLAGS "-Xcompiler=-fno-strict-aliasing")
 	list(APPEND CUDA_NVCC_FLAGS "-Xcompiler=-fPIC")
+	list(APPEND CUDA_NVCC_FLAGS "-Xcompiler=-std=c++14")	
 endif()
 list(APPEND CUDA_NVCC_FLAGS "--extended-lambda")
 list(APPEND CUDA_NVCC_FLAGS "--expt-relaxed-constexpr")
@@ -175,15 +176,20 @@ if (NGP_BUILD_WITH_GUI)
 
 	list(APPEND NGP_INCLUDE_DIRECTORIES "dependencies/glfw/include" "dependencies/imgui")
 
-	if (MSVC)
-		list(APPEND NGP_INCLUDE_DIRECTORIES "dependencies/gl3w")
-		list(APPEND GUI_SOURCES "dependencies/gl3w/GL/gl3w.c")
-		list(APPEND NGP_LIBRARIES opengl32 $<TARGET_OBJECTS:glfw_objects>)
-	else()
-		find_package(GLEW REQUIRED)
-		list(APPEND NGP_INCLUDE_DIRECTORIES ${GLEW_INCLUDE_DIRS})
-		list(APPEND NGP_LIBRARIES GL ${GLEW_LIBRARIES} $<TARGET_OBJECTS:glfw_objects>)
-	endif()
+	list(APPEND NGP_LIBRARIES $<TARGET_OBJECTS:glfw_objects>)
+endif()
+
+if (MSVC)
+	list(APPEND NGP_INCLUDE_DIRECTORIES "dependencies/gl3w")
+	list(APPEND GUI_SOURCES "dependencies/gl3w/GL/gl3w.c")
+	list(APPEND NGP_LIBRARIES opengl32)
+else()
+	find_package(GLEW REQUIRED)
+	list(APPEND NGP_INCLUDE_DIRECTORIES ${GLEW_INCLUDE_DIRS})
+	list(APPEND NGP_LIBRARIES GL ${GLEW_LIBRARIES})
+endif()
+
+if (NGP_BUILD_WITH_GUI)
 
 	list(APPEND GUI_SOURCES
 		dependencies/imguizmo/ImGuizmo.cpp
@@ -273,6 +279,38 @@ list(APPEND NGP_SOURCES
 	src/triangle_bvh.cu
 )
 
+list(APPEND NGP_INCLUDES
+	include/neural-graphics-primitives/triangle_octree.cuh
+	include/neural-graphics-primitives/adam_optimizer.h
+	include/neural-graphics-primitives/bounding_box.cuh
+	include/neural-graphics-primitives/camera_path.h
+	include/neural-graphics-primitives/common.h
+	include/neural-graphics-primitives/common_device.cuh
+	include/neural-graphics-primitives/common_host.h
+	include/neural-graphics-primitives/discrete_distribution.h
+	include/neural-graphics-primitives/dlss.h
+	include/neural-graphics-primitives/envmap.cuh
+	include/neural-graphics-primitives/json_binding.h
+	include/neural-graphics-primitives/marching_cubes.h
+	include/neural-graphics-primitives/nerf.h
+	include/neural-graphics-primitives/nerf_device.cuh
+	include/neural-graphics-primitives/nerf_loader.h
+	include/neural-graphics-primitives/nerf_network.h
+	include/neural-graphics-primitives/openxr_hmd.h
+	include/neural-graphics-primitives/random_val.cuh
+	include/neural-graphics-primitives/render_buffer.h
+	include/neural-graphics-primitives/sdf.h
+	include/neural-graphics-primitives/shared_queue.h
+	include/neural-graphics-primitives/takikawa_encoding.cuh
+	include/neural-graphics-primitives/testbed.h
+	include/neural-graphics-primitives/thread_pool.h
+	include/neural-graphics-primitives/tinyexr_wrapper.h
+	include/neural-graphics-primitives/tinyobj_loader_wrapper.h
+	include/neural-graphics-primitives/trainable_buffer.cuh
+	include/neural-graphics-primitives/triangle.cuh
+	include/neural-graphics-primitives/triangle_bvh.cuh
+)
+
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_BINARY_DIR})
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO ${CMAKE_BINARY_DIR})
@@ -326,13 +364,16 @@ if (NGP_OPTIX)
 	list(APPEND NGP_SOURCES ${OPTIX_PTX_HEADER})
 endif()
 
-add_library(ngp STATIC ${NGP_SOURCES})
+add_library(ngp STATIC ${NGP_SOURCES} ${NGP_INCLUDES})
 set_target_properties(ngp PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON CUDA_SEPARABLE_COMPILATION ON)
 target_compile_definitions(ngp PUBLIC ${NGP_DEFINITIONS})
 target_compile_options(ngp PUBLIC $<$<COMPILE_LANGUAGE:CUDA>:${CUDA_NVCC_FLAGS}>)
 target_include_directories(ngp PUBLIC ${NGP_INCLUDE_DIRECTORIES})
 target_link_directories(ngp PUBLIC ${NGP_LINK_DIRECTORIES})
 target_link_libraries(ngp PUBLIC ${NGP_LIBRARIES} tiny-cuda-nn)
+
+set_property(TARGET ngp PROPERTY
+  MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 
 # Copy shared libraries to the binary directory as needed
 if (NGP_VULKAN)
@@ -373,7 +414,7 @@ if (NGP_BUILD_EXECUTABLE)
 	endif()
 endif(NGP_BUILD_EXECUTABLE)
 
-if (Python_FOUND)
+if (NGP_BUILD_WITH_PYTHON_BINDINGS AND Python_FOUND)
 	add_library(pyngp SHARED src/python_api.cu)
 	set_target_properties(pyngp PROPERTIES CXX_VISIBILITY_PRESET "hidden" CUDA_VISIBILITY_PRESET "hidden")
 	target_link_libraries(pyngp PRIVATE ngp PUBLIC ${PYTHON_LIBRARIES} pybind11::module)

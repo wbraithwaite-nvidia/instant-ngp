@@ -16,7 +16,9 @@
 #pragma once
 
 #ifdef _WIN32
+#ifndef NOMINMAX
 #  define NOMINMAX
+#endif
 #endif
 
 #include <tiny-cuda-nn/common.h>

@@ -171,7 +171,7 @@ void Testbed::set_mode(ETestbedMode mode) {
 	m_mesh = {};
 	m_nerf = {};
 	m_sdf = {};
-	m_volume = {};
+	m_volume = Volume{};
 
 	// Kill training-related things
 	m_encoding = {};
@@ -293,7 +293,13 @@ void Testbed::reload_network_from_file(const fs::path& path) {
 	if (!full_network_config_path.exists()) {
 		tlog::warning() << "Network " << (is_snapshot ? "snapshot" : "config") << " path '" << full_network_config_path << "' does not exist.";
 	} else {
-		m_network_config = load_network_config(full_network_config_path);
+		auto config = load_network_config(full_network_config_path);
+		if (!config.is_null())
+        {
+			m_network_config = config;
+			//HACK: remember the path
+			m_network_config_path = full_network_config_path;
+		}
 	}
 
 	// Reset training if we haven't loaded a snapshot of an already trained model, in which case, presumably the network
@@ -2741,7 +2747,7 @@ void Testbed::train_and_render(bool skip_rendering) {
 	float frame_ms = m_camera_path.rendering ? 0.0f : m_frame_ms.val();
 	apply_camera_smoothing(frame_ms);
 
-	if (!m_render_window || !m_render || skip_rendering) {
+	if (!m_render || skip_rendering) {
 		return;
 	}
 
@@ -2760,7 +2766,7 @@ void Testbed::train_and_render(bool skip_rendering) {
 		autofocus();
 	}
 
-#ifdef NGP_GUI
+#if defined(NGP_GUI)
 	if (m_hmd && m_hmd->is_visible()) {
 		for (auto& view : m_views) {
 			view.visualized_dimension = m_visualized_dimension;
@@ -2770,13 +2776,17 @@ void Testbed::train_and_render(bool skip_rendering) {
 
 		m_nerf.render_with_lens_distortion = false;
 		reset_accumulation(true);
-	} else if (m_single_view) {
+	} else if (m_single_view)
+#endif
+#if 1
+	if (m_single_view)
+	{
 		set_n_views(1);
 		m_n_views = {1, 1};
 
 		auto& view = m_views.front();
 
-		view.full_resolution = m_window_res;
+		//view.full_resolution = m_window_res;
 
 		view.camera0 = m_smoothed_camera;
 
@@ -2857,6 +2867,7 @@ void Testbed::train_and_render(bool skip_rendering) {
 		factor = clamp(factor, 1.0f / 16.0f, 1.0f);
 
 		for (auto&& view : m_views) {
+			
 			if (m_dlss) {
 				view.render_buffer->enable_dlss(*m_dlss_provider, view.full_resolution);
 			} else {
@@ -2864,6 +2875,8 @@ void Testbed::train_and_render(bool skip_rendering) {
 			}
 
 			ivec2 render_res = view.render_buffer->in_resolution();
+			assert(render_res[0] != 0 && render_res[1] != 0);
+
 			ivec2 new_render_res = clamp(ivec2(vec2(view.full_resolution) * factor), view.full_resolution / 16, view.full_resolution);
 
 			if (m_camera_path.rendering) {
@@ -3034,7 +3047,8 @@ void Testbed::create_second_window() {
 	glBindBuffer(GL_ARRAY_BUFFER, 0);
 	glBindVertexArray(0);
 }
-
+#endif
+#if 1
 void Testbed::set_n_views(size_t n_views) {
 	while (m_views.size() > n_views) {
 		m_views.pop_back();
@@ -3050,6 +3064,7 @@ void Testbed::set_n_views(size_t n_views) {
 	}
 };
 #endif //NGP_GUI
+
 
 void Testbed::init_window(int resw, int resh, bool hidden, bool second_window) {
 #ifndef NGP_GUI
@@ -3373,11 +3388,11 @@ bool Testbed::frame() {
 	if (m_hmd && m_hmd->is_visible()) {
 		skip_rendering = false;
 	}
-#endif
 
 	if (!skip_rendering || std::chrono::steady_clock::now() - m_last_gui_draw_time_point > 50ms) {
 		redraw_gui_next_frame();
 	}
+#endif
 
 	try {
 		while (true) {
@@ -3612,17 +3627,19 @@ void Testbed::reset_network(bool clear_density_grid) {
 	// Default config
 	json config = m_network_config;
 
+	// If the network config is incomplete, avoid doing further work.
+	if (config.is_null())
+		return;
+	
 	json& encoding_config = config["encoding"];
 	json& loss_config = config["loss"];
 	json& optimizer_config = config["optimizer"];
 	json& network_config = config["network"];
 
-	// If the network config is incomplete, avoid doing further work.
-	/*
-	if (config.is_null() || encoding_config.is_null() || loss_config.is_null() || optimizer_config.is_null() || network_config.is_null()) {
-		return;
-	}
-	*/
+	//if (config.is_null() || encoding_config.is_null() || loss_config.is_null() || optimizer_config.is_null() || network_config.is_null()) {
+	//	return;
+	//}
+	
 
 	auto dims = network_dims();
 
@@ -3839,6 +3856,8 @@ Testbed::Testbed(ETestbedMode mode) {
 		}
 		tlog::log(s) << msg;
 	});
+
+	tlog::Logger::global()->hideSeverity(tlog::ESeverity::Debug);
 
 	if (!(__CUDACC_VER_MAJOR__ > 10 || (__CUDACC_VER_MAJOR__ == 10 && __CUDACC_VER_MINOR__ >= 2))) {
 		throw std::runtime_error{"Testbed requires CUDA 10.2 or later."};

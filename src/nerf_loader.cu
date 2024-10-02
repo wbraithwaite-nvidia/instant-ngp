@@ -33,6 +33,7 @@
 #include <fstream>
 #include <string>
 #include <vector>
+#include <sstream>
 
 using namespace std::literals;
 
@@ -282,7 +283,7 @@ NerfDataset load_nerf(const std::vector<fs::path>& jsonpaths, float sharpen_amou
 	std::ifstream f{native_string(jsonpaths.front())};
 	nlohmann::json transforms = nlohmann::json::parse(f, nullptr, true, true);
 
-	ThreadPool pool;
+	ThreadPool pool(1);
 
 	struct LoadedImageInfo {
 		ivec2 res = ivec2(0);
@@ -543,7 +544,8 @@ NerfDataset load_nerf(const std::vector<fs::path>& jsonpaths, float sharpen_amou
 		}
 
 
-		if (json.contains("frames") && json["frames"].is_array()) pool.parallel_for_async<size_t>(0, json["frames"].size(), [&progress, &n_loaded, &result, &images, &json, &resolve_path, &supported_image_formats, base_path, image_idx, info, rolling_shutter, principal_point, lens, part_after_underscore, fix_premult, enable_depth_loading, enable_ray_loading](size_t i) {
+		if (json.contains("frames") && json["frames"].is_array())
+			pool.parallel_for_async<size_t>(0, json["frames"].size(), [&progress, &n_loaded, &result, &images, &json, &resolve_path, &supported_image_formats, base_path, image_idx, info, rolling_shutter, principal_point, lens, part_after_underscore, fix_premult, enable_depth_loading, enable_ray_loading](size_t i) {
 			size_t i_img = i + image_idx;
 			auto& frame = json["frames"][i];
 			LoadedImageInfo& dst = images[i_img];
@@ -681,10 +683,19 @@ NerfDataset load_nerf(const std::vector<fs::path>& jsonpaths, float sharpen_amou
 				throw std::runtime_error{"Couldn't read fov."};
 			}
 
+			mat4x4 nerfMatStart;
+			mat4x4 nerfMatEnd;
+			for (int m = 0; m < 4; ++m) {
+				for (int n = 0; n < 4; ++n) {
+					nerfMatStart[n][m] = float(jsonmatrix_start[n][m]);
+					nerfMatEnd[n][m] = float(jsonmatrix_end[n][m]);
+				}
+			}
+
 			for (int m = 0; m < 3; ++m) {
 				for (int n = 0; n < 4; ++n) {
-					result.xforms[i_img].start[n][m] = float(jsonmatrix_start[m][n]);
-					result.xforms[i_img].end[n][m] = float(jsonmatrix_end[m][n]);
+					result.xforms[i_img].start[n][m] = nerfMatStart[m][n];
+					result.xforms[i_img].end[n][m] = nerfMatEnd[m][n];
 				}
 			}
 
@@ -695,8 +706,71 @@ NerfDataset load_nerf(const std::vector<fs::path>& jsonpaths, float sharpen_amou
 			// see if there is a per-frame override
 			read_lens(frame, result.metadata[i_img].lens, result.metadata[i_img].principal_point, result.metadata[i_img].rolling_shutter);
 
+			
+			auto tvec4_to_string = [](const vec4& v) -> std::string {
+				std::ostringstream ss;
+
+				ss << "[";
+				for (int c=0;c<4;++c)
+				{
+					if (c > 0)
+						ss << ",";
+					ss << v[c];
+				}
+				ss << "]";
+				return ss.str();
+			};
+
+			auto tvec3_to_string = [](const vec3& v) -> std::string {
+				std::ostringstream ss;
+
+				ss << "[";
+				for (int c=0;c<3;++c)
+				{
+					if (c > 0)
+						ss << ",";
+					ss << v[c];
+				}
+				ss << "]";
+				return ss.str();
+			};
+			
+			auto tmat4x4_to_string = [=](const mat4x4& mat) -> std::string {
+				std::ostringstream ss;
+				for (int r=0;r<4;++r)
+				{
+					if (r > 0)
+						ss << ",";
+					ss << tvec4_to_string(mat[r]);
+				}
+				return ss.str();
+			};
+
+			auto tmat4x3_to_string = [=](const mat4x3& mat) -> std::string {
+				std::ostringstream ss;
+				for (int r=0;r<4;++r)
+				{
+					if (r > 0)
+						ss << ",";
+					ss << tvec3_to_string(mat[r]);
+				}
+				return ss.str();
+			};
+
+			mat4x4 nerfMat;
+			for (int m = 0; m < 3; ++m) {
+				for (int n = 0; n < 4; ++n) {
+					nerfMat[n][m] = float(jsonmatrix_start[m][n]);
+					nerfMat[n][m] = float(jsonmatrix_end[m][n]);
+				}
+			}
+
+			//tlog::info() << "xforms[" << i_img  << "] (nerf) mat = " << tmat4x4_to_string(nerfMatStart);
+
 			result.xforms[i_img].start = result.nerf_matrix_to_ngp(result.xforms[i_img].start);
 			result.xforms[i_img].end = result.nerf_matrix_to_ngp(result.xforms[i_img].end);
+
+			//tlog::info() << "xforms[" << i_img  << "] (ngp) position = " << tvec3_to_string(result.xforms[i_img].start[3]);			
 
 			progress.update(++n_loaded);
 		}, futures);
