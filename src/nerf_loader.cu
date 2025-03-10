@@ -39,12 +39,18 @@ using namespace std::literals;
 
 namespace ngp {
 
-__global__ void convert_rgba32(const uint64_t num_pixels, const uint8_t* __restrict__ pixels, uint8_t* __restrict__ out, bool white_2_transparent = false, bool black_2_transparent = false, uint32_t mask_color = 0) {
+__global__ void convert_rgba32(const uint64_t n_pixels, const uint32_t width, const uint8_t* __restrict__ pixels, uint8_t* __restrict__ out, bool white_2_transparent = false, bool black_2_transparent = false, uint32_t mask_color = 0, bool flip_y = false) {
 	const uint64_t i = threadIdx.x + blockIdx.x * blockDim.x;
-	if (i >= num_pixels) return;
+	if (i >= n_pixels) return;
+
+	int xi = i % width;
+    int yi = i / width;
+
+	if (flip_y)
+        yi = (n_pixels / width - 1) - yi;
 
 	uint8_t rgba[4];
-	*((uint32_t*)&rgba[0]) = *((uint32_t*)&pixels[i*4]);
+	*((uint32_t*)&rgba[0]) = *((uint32_t*)&pixels[(xi+yi*width)*4]);
 
 	// NSVF dataset has 'white = transparent' madness
 	if (white_2_transparent && rgba[0] == 255 && rgba[1] == 255 && rgba[2] == 255) {
@@ -799,7 +805,7 @@ NerfDataset load_nerf(const std::vector<fs::path>& jsonpaths, float sharpen_amou
 	// copy / convert images to the GPU
 	for (uint32_t i = 0; i < result.n_images; ++i) {
 		const LoadedImageInfo& m = images[i];
-		result.set_training_image(i, m.res, m.pixels, m.depth_pixels, m.depth_scale * result.scale, m.image_data_on_gpu, m.image_type, EDepthDataType::UShort, sharpen_amount, m.white_transparent, m.black_transparent, m.mask_color, m.rays);
+		result.set_training_image(i, m.res, m.pixels, m.depth_pixels, m.depth_scale * result.scale, m.image_data_on_gpu, m.image_type, EDepthDataType::UShort, sharpen_amount, m.white_transparent, m.black_transparent, m.mask_color, false, m.rays);
 		CUDA_CHECK_THROW(cudaDeviceSynchronize());
 	}
 	CUDA_CHECK_THROW(cudaDeviceSynchronize());
@@ -816,7 +822,7 @@ NerfDataset load_nerf(const std::vector<fs::path>& jsonpaths, float sharpen_amou
 	return result;
 }
 
-void NerfDataset::set_training_image(int frame_idx, const ivec2& image_resolution, const void* pixels, const void* depth_pixels, float depth_scale, bool image_data_on_gpu, EImageDataType image_type, EDepthDataType depth_type, float sharpen_amount, bool white_transparent, bool black_transparent, uint32_t mask_color, const Ray *rays) {
+void NerfDataset::set_training_image(int frame_idx, const ivec2& image_resolution, const void* pixels, const void* depth_pixels, float depth_scale, bool image_data_on_gpu, EImageDataType image_type, EDepthDataType depth_type, float sharpen_amount, bool white_transparent, bool black_transparent, uint32_t mask_color, bool flip_y, const Ray *rays) {
 	if (frame_idx < 0 || frame_idx >= n_images) {
 		throw std::runtime_error{"NerfDataset::set_training_image: invalid frame index"};
 	}
@@ -847,7 +853,7 @@ void NerfDataset::set_training_image(int frame_idx, const ivec2& image_resolutio
 
 	switch (image_type) {
 		default: throw std::runtime_error{"unknown image type in set_training_image"};
-		case EImageDataType::Byte: linear_kernel(convert_rgba32, 0, nullptr, n_pixels, (uint8_t*)pixels, (uint8_t*)dst, white_transparent, black_transparent, mask_color); break;
+		case EImageDataType::Byte: linear_kernel(convert_rgba32, 0, nullptr, n_pixels, image_resolution[0], (uint8_t*)pixels, (uint8_t*)dst, white_transparent, black_transparent, mask_color, flip_y); break;
 		case EImageDataType::Half: // fallthrough is intended
 		case EImageDataType::Float: CUDA_CHECK_THROW(cudaMemcpy(dst, pixels, img_size * image_type_size(image_type), image_data_on_gpu ? cudaMemcpyDeviceToDevice : cudaMemcpyHostToDevice)); break;
 	}

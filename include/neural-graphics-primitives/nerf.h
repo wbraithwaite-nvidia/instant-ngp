@@ -19,26 +19,34 @@
 
 namespace ngp {
 
-struct RaysNerfSoa {
+struct RaysNerfSoa
+{
 #if defined(__CUDACC__) || (defined(__clang__) && defined(__CUDA__))
-	void copy_from_other_async(const RaysNerfSoa& other, cudaStream_t stream) {
-		CUDA_CHECK_THROW(cudaMemcpyAsync(rgba, other.rgba, size * sizeof(vec4), cudaMemcpyDeviceToDevice, stream));
-		CUDA_CHECK_THROW(cudaMemcpyAsync(depth, other.depth, size * sizeof(float), cudaMemcpyDeviceToDevice, stream));
-		CUDA_CHECK_THROW(cudaMemcpyAsync(payload, other.payload, size * sizeof(NerfPayload), cudaMemcpyDeviceToDevice, stream));
-	}
+    void copy_from_other_async(int slice_count, const RaysNerfSoa& other, cudaStream_t stream)
+    {
+        CUDA_CHECK_THROW(
+            cudaMemcpyAsync(rgba, other.rgba, slice_count * size * sizeof(vec4), cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK_THROW(
+            cudaMemcpyAsync(depth, other.depth, slice_count * size * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK_THROW(cudaMemcpyAsync(
+            payload, other.payload, size * sizeof(NerfPayload), cudaMemcpyDeviceToDevice, stream));
+    }
 #endif
 
-	void set(vec4* rgba, float* depth, NerfPayload* payload, size_t size) {
-		this->rgba = rgba;
-		this->depth = depth;
-		this->payload = payload;
-		this->size = size;
-	}
+    void set(vec4* rgba, float* depth, NerfPayload* payload, size_t size, int slice_count)
+    {
+        this->rgba    = rgba;
+        this->depth   = depth;
+        this->payload = payload;
+        this->size    = size;
+        this->slice_count = slice_count;
+    }
 
-	vec4* rgba;
-	float* depth;
-	NerfPayload* payload;
-	size_t size;
+    vec4* rgba;
+    float* depth;
+    NerfPayload* payload;
+    size_t size;
+    int slice_count;
 };
 
-}
+} // namespace ngp

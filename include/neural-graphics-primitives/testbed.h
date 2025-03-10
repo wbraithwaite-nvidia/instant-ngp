@@ -41,6 +41,7 @@
 #endif
 
 #include <thread>
+#include <vector>
 
 #include <cuda.h>
 
@@ -202,7 +203,7 @@ public:
 			cudaStream_t stream
 		);
 
-		void enlarge(size_t n_elements, uint32_t padded_output_width, uint32_t n_extra_dims, cudaStream_t stream);
+		void enlarge(size_t n_elements, uint32_t padded_output_width, uint32_t n_extra_dims, int slice_count, cudaStream_t stream);
 		RaysNerfSoa& rays_hit() { return m_rays_hit; }
 		RaysNerfSoa& rays_init() { return m_rays[0]; }
 		uint32_t n_rays_initialized() const { return m_n_rays_initialized; }
@@ -621,9 +622,9 @@ public:
 
 	std::function<bool()> m_keyboard_event_callback;
 
-	std::shared_ptr<GLTexture> m_pip_render_texture;
-	std::vector<std::shared_ptr<GLTexture>> m_rgba_render_textures;
-	std::vector<std::shared_ptr<GLTexture>> m_depth_render_textures;
+	std::shared_ptr<SurfaceProvider> m_pip_render_texture;
+	std::vector<std::shared_ptr<SurfaceProvider>> m_rgba_render_textures;
+	std::vector<std::shared_ptr<SurfaceProvider>> m_depth_render_textures;
 #endif
 
 

@@ -117,7 +117,7 @@ cudaArray_t GLTexture::array() {
 	return m_cuda_mapping->array();
 }
 
-void GLTexture::blit_from_cuda_mapping() {
+void GLTexture::blit_to_surface() {
 	if (!m_cuda_mapping || m_cuda_mapping->is_interop()) {
 		return;
 	}
@@ -157,7 +157,36 @@ void GLTexture::load(const uint8_t* data, ivec2 new_size, int n_channels) {
 	glTexImage2D(GL_TEXTURE_2D, 0, m_internal_format, new_size.x, new_size.y, 0, m_format, GL_UNSIGNED_BYTE, data);
 }
 
+void GLTexture::save(const fs::path& path)
+{
+    int comp = m_n_channels, width = m_size[0], height = m_size[1];
+
+	int src_channels = 0;
+    if (m_format == GL_RGBA)
+        src_channels = 4;
+
+    std::vector<uint8_t> pixels(m_size[0] * m_size[1] * src_channels); // width * height * RGBA
+
+	GLuint fbo = 0;
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_texture_id, 0);
+    assert(glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE);
+
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+
+	if (m_format == GL_RGBA)
+	    glReadPixels(0, 0, m_size[0], m_size[1], GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDeleteFramebuffers(1, &fbo);
+
+    write_stbi(path, width, height, src_channels, pixels.data());
+}
+
 void GLTexture::resize(const ivec2& new_size, int n_channels, bool is_8bit) {
+
 	if (m_size == new_size && m_n_channels == n_channels && m_is_8bit == is_8bit) {
 		return;
 	}
@@ -604,7 +633,8 @@ __global__ void depth_splat_kernel(
 	}
 
 	uint32_t idx = x + resolution.x * y;
-	surf2Dwrite(to_ndc_depth(depth_buffer[idx], znear, zfar), surface, x * sizeof(float), y);
+	//surf2Dwrite(to_ndc_depth(depth_buffer[idx], znear, zfar), surface, x * sizeof(float), y);
+	surf2Dwrite(depth_buffer[idx], surface, x * sizeof(float), y);
 }
 
 void CudaRenderBufferView::clear(cudaStream_t stream) const {
@@ -666,12 +696,12 @@ void CudaRenderBuffer::tonemap(float exposure, const vec4& background_color, ECo
 	tonemap_kernel<<<blocks, threads, 0, stream>>>(
 		res,
 		exposure,
-		background_color,
+		background_color, // CAVEAT: this is in srgb
 		accumulate_buffer(),
 		m_color_space,
 		output_color_space,
 		m_tonemap_curve,
-		m_dlss && output_color_space == EColorSpace::SRGB,
+		m_dlss && output_color_space == EColorSpace::SRGB, // clamp output color from 0 to 1
 		(bool)m_dlss, // DLSS seems to perform best with non-premultiplied alpha (probably trained on such data)
 		m_dlss ? m_dlss->frame() : surface()
 	);

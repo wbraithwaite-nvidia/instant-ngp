@@ -34,7 +34,8 @@ public:
 	virtual cudaSurfaceObject_t surface() = 0;
 	virtual cudaArray_t array() = 0;
 	virtual ivec2 resolution() const = 0;
-	virtual void resize(const ivec2&, int n_channels = 4) = 0;
+	virtual void resize(const ivec2&, int n_channels = 4) = 0;	
+	virtual void blit_to_surface()  = 0;
 };
 
 class CudaSurface2D : public SurfaceProvider {
@@ -62,6 +63,10 @@ public:
 
 	ivec2 resolution() const override {
 		return m_size;
+	}
+
+	void blit_to_surface() override
+    {
 	}
 
 private:
@@ -100,11 +105,13 @@ public:
 
 	cudaArray_t array() override;
 
-	void blit_from_cuda_mapping();
+	void blit_to_surface() override;
 
 	const std::string& texture_name() const { return m_texture_name; }
 
 	bool is_8bit() { return m_is_8bit; }
+
+	void save(const fs::path& path);
 
 	void load(const fs::path& path);
 
@@ -172,7 +179,7 @@ struct CudaRenderBufferView {
 
 class CudaRenderBuffer {
 public:
-	CudaRenderBuffer(const std::shared_ptr<SurfaceProvider>& rgba, const std::shared_ptr<SurfaceProvider>& depth = nullptr) : m_rgba_target{rgba}, m_depth_target{depth} {}
+	CudaRenderBuffer(const std::shared_ptr<SurfaceProvider>& rgba = nullptr, const std::shared_ptr<SurfaceProvider>& depth = nullptr) : m_rgba_target{rgba}, m_depth_target{depth} {}
 
 	CudaRenderBuffer(const CudaRenderBuffer& other) = delete;
 	CudaRenderBuffer& operator=(const CudaRenderBuffer& other) = delete;
@@ -180,7 +187,7 @@ public:
 	CudaRenderBuffer& operator=(CudaRenderBuffer&& other) = default;
 
 	cudaSurfaceObject_t surface() {
-		return m_rgba_target->surface();
+		return (m_rgba_target)?m_rgba_target->surface():0;
 	}
 
 	ivec2 in_resolution() const {
@@ -188,7 +195,7 @@ public:
 	}
 
 	ivec2 out_resolution() const {
-		return m_rgba_target->resolution();
+		return (m_rgba_target)?m_rgba_target->resolution():ivec2{0,0};
 	}
 
 	void resize(const ivec2& res);
@@ -294,6 +301,16 @@ public:
 
 	const std::shared_ptr<Buffer2D<uint8_t>>& hidden_area_mask() const {
 		return m_hidden_area_mask;
+	}
+
+	void setRgbaTarget(std::shared_ptr<SurfaceProvider> target)
+    {
+		m_rgba_target = target;
+	}
+	
+	void setDepthTarget(std::shared_ptr<SurfaceProvider> target)
+    {
+		m_depth_target = target;
 	}
 
 private:
