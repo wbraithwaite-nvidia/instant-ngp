@@ -164,8 +164,25 @@ void GLTexture::save(const fs::path& path)
 	int src_channels = 0;
     if (m_format == GL_RGBA)
         src_channels = 4;
+    else if (m_format == GL_RED)
+        src_channels = 1;
 
-    std::vector<uint8_t> pixels(m_size[0] * m_size[1] * src_channels); // width * height * RGBA
+	std::vector<uint8_t> pixels;
+
+	GLenum dataTypeGl = GL_NONE;
+
+	if (m_internal_format == GL_RGBA32F || m_internal_format == GL_R32F)
+    {
+        dataTypeGl = GL_FLOAT;
+		pixels.resize(m_size[0] * m_size[1] * src_channels * sizeof(float));
+	}
+    else if (m_internal_format == GL_RGBA8 || m_internal_format == GL_R8)
+    {
+        dataTypeGl = GL_UNSIGNED_BYTE;
+        pixels.resize(m_size[0] * m_size[1] * src_channels * sizeof(uint8_t));
+    }
+
+	assert(dataTypeGl != GL_NONE);
 
 	GLuint fbo = 0;
     glGenFramebuffers(1, &fbo);
@@ -176,8 +193,7 @@ void GLTexture::save(const fs::path& path)
     glReadBuffer(GL_COLOR_ATTACHMENT0);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
 
-	if (m_format == GL_RGBA)
-	    glReadPixels(0, 0, m_size[0], m_size[1], GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+    glReadPixels(0, 0, m_size[0], m_size[1], m_format, dataTypeGl, pixels.data());
 
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glDeleteFramebuffers(1, &fbo);

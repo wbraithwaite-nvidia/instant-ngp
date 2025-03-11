@@ -237,6 +237,8 @@ int write_stbi(const fs::path& path, int width, int height, int comp, const uint
 		return stbi_write_tga_to_func(istream_stbi_write_func, &f, width, height, comp, pixels);
 	} else if (equals_case_insensitive(path.extension(), "bmp")) {
 		return stbi_write_bmp_to_func(istream_stbi_write_func, &f, width, height, comp, pixels);
+    } else if (equals_case_insensitive(path.extension(), "hdr")) {
+		return stbi_write_hdr_to_func(istream_stbi_write_func, &f, width, height, comp, (const float*)pixels);
 	} else {
 		throw std::runtime_error{fmt::format("write_stbi: unknown image extension '{}'", path.extension())};
 	}
