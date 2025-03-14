@@ -660,6 +660,7 @@ void CudaRenderBufferView::clear(cudaStream_t stream) const {
 }
 
 void CudaRenderBuffer::resize(const ivec2& res) {
+
 	m_in_resolution = res;
 	m_frame_buffer.enlarge(res.x * res.y);
 	m_depth_buffer.enlarge(res.x * res.y);
@@ -670,7 +671,7 @@ void CudaRenderBuffer::resize(const ivec2& res) {
 
 	ivec2 out_res = m_dlss ? m_dlss->out_resolution() : res;
 	auto prev_out_res = out_resolution();
-	m_rgba_target->resize(out_res, 4);
+    m_rgba_target->resize(out_res, 4);
 
 	if (out_resolution() != prev_out_res) {
 		reset_accumulation();

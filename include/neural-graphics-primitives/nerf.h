@@ -19,8 +19,45 @@
 
 namespace ngp {
 
+struct SliceColors
+{
+	static const int kSize = 1;
+
+    vec4 slice[kSize];
+
+    inline __device__ __host__ vec4& operator[](int i)
+    {
+        return slice[i];
+    }
+
+    inline __device__ __host__ const vec4& operator[](int i) const
+    {
+        return slice[i];
+    }
+};
+
+struct SliceDepths
+{
+    static const int kSize = 1;
+
+    float slice[kSize];
+
+    inline __device__ __host__ float& operator[](int i)
+    {
+        return slice[i];
+    }
+
+    inline __device__ __host__ const float& operator[](int i) const
+    {
+        return slice[i];
+    }
+};
+
 struct RaysNerfSoa
 {
+    using ColorType = SliceColors;
+    using DepthType = SliceDepths;
+
 #if defined(__CUDACC__) || (defined(__clang__) && defined(__CUDA__))
     void copy_from_other_async(int slice_count, const RaysNerfSoa& other, cudaStream_t stream)
     {
@@ -28,25 +65,23 @@ struct RaysNerfSoa
             cudaMemcpyAsync(rgba, other.rgba, slice_count * size * sizeof(vec4), cudaMemcpyDeviceToDevice, stream));
         CUDA_CHECK_THROW(
             cudaMemcpyAsync(depth, other.depth, slice_count * size * sizeof(float), cudaMemcpyDeviceToDevice, stream));
-        CUDA_CHECK_THROW(cudaMemcpyAsync(
-            payload, other.payload, size * sizeof(NerfPayload), cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK_THROW(
+            cudaMemcpyAsync(payload, other.payload, size * sizeof(NerfPayload), cudaMemcpyDeviceToDevice, stream));
     }
 #endif
 
-    void set(vec4* rgba, float* depth, NerfPayload* payload, size_t size, int slice_count)
+    void set(ColorType* rgba, DepthType* depth, NerfPayload* payload, size_t size, int slice_count)
     {
-        this->rgba    = rgba;
-        this->depth   = depth;
-        this->payload = payload;
-        this->size    = size;
-        this->slice_count = slice_count;
+        this->rgba        = rgba;
+        this->depth       = depth;
+        this->payload     = payload;
+        this->size        = size;
     }
 
-    vec4* rgba;
-    float* depth;
+    ColorType* rgba;
+    DepthType* depth;
     NerfPayload* payload;
     size_t size;
-    int slice_count;
 };
 
 } // namespace ngp

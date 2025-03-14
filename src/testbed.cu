@@ -5434,7 +5434,7 @@ void Testbed::render_frame_main(CudaDevice& device,
     case ETestbedMode::Nerf:
         if (!m_render_ground_truth || m_ground_truth_alpha < 1.0f)
         {
-            render_nerf(device.stream(),
+            render_nerf_slices(device.stream(),
                         device,
                         device.render_buffer_view(),
                         device.nerf_network(),

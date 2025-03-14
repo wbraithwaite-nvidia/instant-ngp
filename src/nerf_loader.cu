@@ -179,6 +179,30 @@ NerfDataset create_empty_nerf_dataset(size_t n_images, int aabb_scale, bool is_h
 	return result;
 }
 
+
+NerfDataset& resize_nerf_dataset(NerfDataset& result, size_t n_images, int aabb_scale, bool is_hdr)
+{
+    result.n_images             = n_images;
+    result.sharpness_resolution = {128, 72};
+    result.sharpness_data.enlarge(result.sharpness_resolution.x * result.sharpness_resolution.y * result.n_images);
+    result.xforms.resize(n_images);
+    result.metadata.resize(n_images);
+    result.pixelmemory.resize(n_images);
+    result.depthmemory.resize(n_images);
+    result.raymemory.resize(n_images);
+    result.scale      = NERF_SCALE;
+    result.offset     = {0.5f, 0.5f, 0.5f};
+    result.aabb_scale = aabb_scale;
+    result.is_hdr     = is_hdr;
+    result.paths      = std::vector<std::string>(n_images, "");
+    for (size_t i = 0; i < n_images; ++i)
+    {
+        result.xforms[i].start = mat4x3::identity();
+        result.xforms[i].end   = mat4x3::identity();
+    }
+    return result;
+}
+
 void read_lens(const nlohmann::json& json, Lens& lens, vec2& principal_point, vec4& rolling_shutter) {
 	ELensMode mode = ELensMode::Perspective;
 

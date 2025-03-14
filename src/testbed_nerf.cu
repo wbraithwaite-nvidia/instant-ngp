@@ -24,6 +24,7 @@
 #include <neural-graphics-primitives/testbed.h>
 #include <neural-graphics-primitives/trainable_buffer.cuh>
 #include <neural-graphics-primitives/triangle_octree.cuh>
+#include <neural-graphics-primitives/nerf.h>
 
 #include <tiny-cuda-nn/encodings/grid.h>
 #include <tiny-cuda-nn/encodings/spherical_harmonics.h>
@@ -39,6 +40,8 @@
 #if NVPV_USE_OPENVXL
 #include <openvxl/compute/cuda.h>
 #include <openvxl/platform/cuda/cuda.h>
+#include <openvxl/math/AffineTransform.h> // for AffineTransform
+#include <openvxl/math/Color.h>           // for colorFromPackedRGBA
 
 namespace vxl {
 using namespace openvxl;
@@ -57,7 +60,7 @@ namespace ngp {
 OPENVXL_CUDA_INLINE int getSliceIndexFromDepth(float depth, int sliceCount, float depthNear, float depthFar)
 {
     float unitZ    = vxl::clamp((depth - depthNear) / (depthFar - depthNear), 0.f, 1.f);
-    float warpedZ  = vxl::pow(unitZ, 1.f / 2);
+    float warpedZ  = vxl::pow(unitZ, 1.f / 1);
     int sliceIndex = (sliceCount) *warpedZ;
     return vxl::clamp(sliceIndex, 0, sliceCount - 1);
 }
@@ -67,14 +70,14 @@ OPENVXL_CUDA_INLINE int getSliceIndexFromDepth(float depth, int sliceCount, floa
 OPENVXL_CUDA_INLINE float getDepthFromSliceIndex(int sliceIndex, int sliceCount, float depthNear, float depthFar)
 {
     float warpedZ = (float) sliceIndex / (sliceCount - 1);
-    float unitZ   = vxl::pow(warpedZ, 2.f);
+    float unitZ   = vxl::pow(warpedZ, 1.f);
     return unitZ * (depthFar - depthNear) + depthNear;
 }
 
 static constexpr uint32_t MARCH_ITER = 10000;
 
 static constexpr uint32_t MIN_STEPS_INBETWEEN_COMPACTION = 1;
-static constexpr uint32_t MAX_STEPS_INBETWEEN_COMPACTION = 1;
+static constexpr uint32_t MAX_STEPS_INBETWEEN_COMPACTION = 8;
 
 Testbed::NetworkDims Testbed::network_dims_nerf() const
 {
@@ -522,6 +525,126 @@ __global__ void advance_pos_nerf_kernel(const uint32_t n_elements,
                      cone_angle_constant);
 }
 
+// move to next position along the ray.
+__global__ void step_pos_nerf_kernel(const uint32_t n_elements,
+                                     BoundingBox render_aabb,
+                                     mat3 render_aabb_to_local,
+                                     vec3 camera_fwd,
+                                     vec2 focal_length,
+                                     uint32_t sample_index,
+                                     NerfPayload* __restrict__ payloads,
+                                     const uint8_t* __restrict__ density_grid,
+                                     uint32_t min_mip,
+                                     uint32_t max_mip,
+                                     float cone_angle_constant,
+                                     float delta_z)
+{
+    const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i >= n_elements)
+        return;
+
+    auto& payload = payloads[i];
+
+    /*if (!payload.alive)
+    {
+        return;
+    }*/
+
+    vec3 origin = payload.origin;
+    vec3 dir    = payload.dir;
+    vec3 idir   = vec3(1.0f) / dir;
+
+    // we use a ray cone because the pixel has area!
+    float cone_angle = calc_cone_angle(dot(dir, camera_fwd), focal_length, cone_angle_constant);
+
+    // advance a random amount of steps in logarithmic cone-space.
+    //int n   = delta_z; // ld_random_val(sample_index, payload.idx * 786433)
+    float t =
+        advance_n_steps(payload.t, cone_angle, delta_z + 0.2f * ld_random_val(sample_index, payload.idx * 786433));
+
+#if 0
+    t = if_unoccupied_advance_to_next_occupied_voxel(
+        t, cone_angle, {origin, dir}, idir, density_grid, min_mip, max_mip, render_aabb, render_aabb_to_local);
+#endif
+
+    if (t >= MAX_DEPTH())
+    {
+        // terminate the ray if we reach the max depth.
+        payload.alive = false;
+    }
+    else
+    {
+        payload.t = t;
+    }
+}
+
+__global__ void generate_next_nerf_network_inputs_slices(const uint32_t n_elements,
+                                                         BoundingBox render_aabb,
+                                                         mat3 render_aabb_to_local,
+                                                         BoundingBox aabb,
+                                                         int sample_index,
+                                                         vec2 focal_length,
+                                                         vec3 camera_fwd,
+                                                         NerfPayload* __restrict__ payloads,
+                                                         PitchedPtr<NerfCoordinate> network_input,
+                                                         uint32_t n_steps,
+                                                         const uint8_t* __restrict__ density_grid,
+                                                         uint32_t min_mip,
+                                                         uint32_t max_mip,
+                                                         float cone_angle_constant,
+                                                         const float* extra_dims)
+{
+    const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i >= n_elements)
+        return;
+
+    NerfPayload& payload = payloads[i];
+    /*
+    if (!payload.alive)
+    {
+        return;
+    }*/
+
+    vec3 origin = payload.origin;
+    vec3 dir    = payload.dir;
+    vec3 idir   = vec3(1.0f) / dir;
+
+    float cone_angle = calc_cone_angle(dot(dir, camera_fwd), focal_length, cone_angle_constant);
+
+    float t = payload.t;
+
+    for (uint32_t j = 0; j < n_steps; ++j)
+    {
+        // calc the step size.
+        float dt = calc_dt(t, cone_angle);
+
+        // setup the network for the new position
+        network_input(i + j * n_elements)
+            ->set_with_optional_extra_dims(warp_position(origin + dir * t, aabb),
+                                           warp_direction(dir),
+                                           warp_dt(dt),
+                                           extra_dims,
+                                           network_input.stride_in_bytes); // XXXCONE
+
+        // advance to next voxel.
+        //t = if_unoccupied_advance_to_next_occupied_voxel(
+        //    t, cone_angle, {origin, dir}, idir, density_grid, min_mip, max_mip, render_aabb, render_aabb_to_local);
+        t = advance_n_steps(t, cone_angle, 1 + 0.2f * ld_random_val(sample_index, payload.idx * 786433));
+
+        if (t >= MAX_DEPTH())
+        {
+            // this ray has left the volume, so record the final step.
+            payload.n_steps = j;
+            return;
+        }
+
+        t += dt;
+    }
+
+    payload.t       = t;
+    payload.n_steps = n_steps;
+}
+
 __global__ void generate_nerf_network_inputs_from_positions(const uint32_t n_elements,
                                                             BoundingBox aabb,
                                                             const vec3* __restrict__ pos,
@@ -632,21 +755,28 @@ __global__ void generate_next_nerf_network_inputs(const uint32_t n_elements,
 
     for (uint32_t j = 0; j < n_steps; ++j)
     {
+        // advance to next voxel.
         t = if_unoccupied_advance_to_next_occupied_voxel(
             t, cone_angle, {origin, dir}, idir, density_grid, min_mip, max_mip, render_aabb, render_aabb_to_local);
+
         if (t >= MAX_DEPTH())
         {
+            // this ray has left the volume, so record the final step.
             payload.n_steps = j;
             return;
         }
 
+        // calc the step size.
         float dt = calc_dt(t, cone_angle);
+
+        // setup the network for the new position
         network_input(i + j * n_elements)
             ->set_with_optional_extra_dims(warp_position(origin + dir * t, train_aabb),
                                            warp_direction(dir),
                                            warp_dt(dt),
                                            extra_dims,
                                            network_input.stride_in_bytes); // XXXCONE
+
         t += dt;
     }
 
@@ -654,17 +784,20 @@ __global__ void generate_next_nerf_network_inputs(const uint32_t n_elements,
     payload.n_steps = n_steps;
 }
 
+// for each ray, composite n steps.
 __global__ void composite_kernel_nerf(const uint32_t n_elements,
                                       const uint32_t stride,
                                       const uint32_t current_step,
+                                      ivec2 resolution,
+                                      int slice_count,
                                       BoundingBox aabb,
                                       float glow_y_cutoff,
                                       int glow_mode,
                                       mat4x3 camera_matrix,
                                       vec2 focal_length,
                                       float depth_scale,
-                                      vec4* __restrict__ rgba,
-                                      float* __restrict__ depth,
+                                      RaysNerfSoa::ColorType* __restrict__ rgba,
+                                      RaysNerfSoa::DepthType* __restrict__ depth,
                                       NerfPayload* payloads,
                                       PitchedPtr<NerfCoordinate> network_input,
                                       const network_precision_t* __restrict__ network_output,
@@ -688,18 +821,24 @@ __global__ void composite_kernel_nerf(const uint32_t n_elements,
         return;
     }
 
-    // fetch the current framebuffer color...
-    vec4 local_rgba   = rgba[i];
-    float local_depth = depth[i];
+    int slice_i = 0;
 
-    float local_depth_max = 0;
+    // fetch the current framebuffer color...
+    vec4 local_rgba   = rgba[i][slice_i];
+    float local_depth = depth[i][slice_i];
+
+    float local_depth_max = local_depth;
 
     vec3 origin  = payload.origin;
     vec3 cam_fwd = camera_matrix[2];
-    // Composite in the last n steps
+
+    // Composite n steps.
+    // the ray payload contains the amount of available steps of network data.
+    // it may be less that what is requested.
     uint32_t actual_n_steps = payload.n_steps;
     uint32_t j              = 0;
 
+    ivec2 debug_pixel = {(int) payload.idx % resolution.x, (int) payload.idx / resolution.x};
     /*
 	{
         rgba[i]         = vec4(1, (float)i / n_elements, 0, 1);
@@ -708,6 +847,14 @@ __global__ void composite_kernel_nerf(const uint32_t n_elements,
 		return;
 	}
 	*/
+
+    //if (debug_pixel.x == 100 && debug_pixel.y == 100)
+    //    OPENVXL_LOG_VAR3(0, slice_i, local_rgba.a);
+
+    bool ray_terminated = false;
+
+    float depthNear = 0.5f;
+    float depthFar  = 1.5f;
 
     // march n steps...
     for (; j < actual_n_steps; ++j)
@@ -721,17 +868,49 @@ __global__ void composite_kernel_nerf(const uint32_t n_elements,
         vec3 warped_pos             = input->pos.p;
         vec3 pos                    = unwarp_position(warped_pos, aabb);
         local_depth                 = dot(cam_fwd, pos - camera_matrix[3]);
-        /*
-        const int sliceCount = 4;
-        float depthNear      = 0;
-        float depthFar       = 4;
-        int sliceIndex       = getSliceIndexFromDepth(local_depth, sliceCount, depthNear, depthFar);
 
-		if (sliceIndex != 1)
-			break;
-		*/
+#if 0
+
+        int slice_index = getSliceIndexFromDepth(local_depth, slice_count, depthNear, depthFar);
+
+        //if (debug_pixel.x == 100 && debug_pixel.y == 100)
+        //    OPENVXL_LOG_VAR3(j, local_depth, slice_index);
+
+        // only do one slice at a time. once the slice changes we stop processing this ray.
+        if (slice_i != slice_index)
+        {
+            // finish this slice..
+            rgba[i][slice_i]  = local_rgba;
+            depth[i][slice_i] = local_depth_max;
+
+            slice_i = slice_index;
+
+            // fetch the current framebuffer color for the slice...
+            local_rgba  = rgba[i][slice_i];
+            local_depth = depth[i][slice_i];
+
+#if 0
+            if (debug_pixel.x == 100 && debug_pixel.y == 100)
+                OPENVXL_LOG_VAR3(j, slice_i, local_rgba.a);
+#endif
+            //break;
+        }
+		
+        // we have to have some criteria for termination, or we will trace to the maxdepth (very slow)!
+        if (local_depth > 2)
+        {
+            //ray_terminated = true;
+            //if (debug_pixel.x == 100 && debug_pixel.y == 100)
+            //    OPENVXL_LOG_VAR2(ray_terminated, local_depth);
+            break;
+        }
+
+        //if (sliceIndex != 1)
+        //	break;
+
         //if (i == 100)
         //    OPENVXL_LOG_VAR4(sliceIndex, payload.origin.x, payload.origin.y, payload.origin.z);
+#endif
 
         float T     = 1.f - local_rgba.a;
         float dt    = unwarp_dt(input->dt);
@@ -744,6 +923,16 @@ __global__ void composite_kernel_nerf(const uint32_t n_elements,
 
         vec3 rgb = network_to_rgb_vec(local_network_output, rgb_activation);
 
+        /*
+        {
+            auto color      = vxl::Vec3f32(rgb.x, rgb.y, rgb.z);
+            auto debugTint  = vxl::Vec3f32(vxl::math::rgbaIntToFloat(vxl::fasthash<uint32_t>(slice_index)));
+            auto debugAlpha = 0.01f;
+            color           = vxl::mix(color, debugTint, debugAlpha);
+
+            rgb = vec3(color[0], color[1], color[2]);
+        }
+		*/
         if (glow_mode)
         { // random grid visualizations ftw!
 #if 0
@@ -903,6 +1092,7 @@ __global__ void composite_kernel_nerf(const uint32_t n_elements,
         {
             payload.max_weight = weight;
             // get eyeZ for hit pos.
+            local_depth     = dot(cam_fwd, pos - camera_matrix[3]);
             local_depth_max = local_depth;
 
             // get distance from hit pos to camera origin.
@@ -913,18 +1103,269 @@ __global__ void composite_kernel_nerf(const uint32_t n_elements,
         if (local_rgba.a > (1.0f - min_transmittance))
         {
             local_rgba /= local_rgba.a;
+            //ray_terminated = true;
             break;
         }
+
+        /*
+        // terminate early if we reach opacity
+        if (slice_i == slice_count - 1 && local_rgba.a > (1.0f - min_transmittance))
+        {
+            local_rgba /= local_rgba.a;
+            ray_terminated = true;
+            break;
+        }
+		*/
     }
 
-    if (j < n_steps)
+#if 1
+    // if we are not rendering slices, then we can terminate if a ray
+    // breaks because of opacity threshold.
+    // but slices need the data even though the ray terminated.
+
+    if (j < n_steps) //if (ray_terminated)
     {
         payload.alive   = false;
         payload.n_steps = j + current_step;
     }
+#endif
 
-    rgba[i]  = local_rgba;
-    depth[i] = local_depth_max;
+    rgba[i][slice_i]  = local_rgba;
+    depth[i][slice_i] = local_depth_max;
+}
+
+// for each ray, composite n steps.
+__global__ void composite_kernel_nerf_slice(const uint32_t n_elements,
+                                            const uint32_t stride,
+                                            const uint32_t current_step,
+                                            ivec2 resolution,
+                                            int slice_count,
+                                            BoundingBox aabb,
+                                            mat4x3 camera_matrix,
+                                            vec2 focal_length,
+                                            float depth_scale,
+                                            RaysNerfSoa::ColorType* __restrict__ rgba,
+                                            RaysNerfSoa::DepthType* __restrict__ depth,
+                                            NerfPayload* payloads,
+                                            PitchedPtr<NerfCoordinate> network_input,
+                                            const network_precision_t* __restrict__ network_output,
+                                            uint32_t padded_output_width,
+                                            uint32_t n_steps,
+                                            const uint8_t* __restrict__ density_grid,
+                                            ENerfActivation rgb_activation,
+                                            ENerfActivation density_activation,
+                                            float min_transmittance)
+{
+    const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i >= n_elements)
+        return;
+
+    NerfPayload& payload = payloads[i];
+
+    if (!payload.alive)
+        return;
+
+    int current_slice_i = -1;
+
+    // fetch the nearest slice color...
+    vec4 local_rgba;   //   = rgba[i][current_slice_i];
+    float local_depth; // = depth[i][current_slice_i];
+    float local_depth_max = 0;
+
+    vec3 origin  = payload.origin;
+    vec3 cam_fwd = camera_matrix[2];
+
+    // Composite n steps.
+    // the ray payload contains the amount of available steps of network data.
+    // it may be less that what is requested.
+    uint32_t actual_n_steps = payload.n_steps;
+    uint32_t j              = 0;
+
+    ivec2 debug_pixel = {(int) payload.idx % resolution.x, (int) payload.idx / resolution.x};
+    /*
+	{
+        rgba[i]         = vec4(1, (float)i / n_elements, 0, 1);
+		payload.alive   = false;
+        payload.n_steps = 0 + current_step;
+		return;
+	}
+	*/
+
+    //if (debug_pixel.x == 100 && debug_pixel.y == 100)
+    //    OPENVXL_LOG_VAR3(0, slice_i, local_rgba.a);
+
+    bool ray_terminated = false;
+
+    float depthNear = 1.0f;
+    float depthFar  = 1.25f;
+
+    // march n steps...
+    for (; j < actual_n_steps; ++j)
+    {
+        tvec<network_precision_t, 4> local_network_output;
+        local_network_output[0]     = network_output[i + j * n_elements + 0 * stride];
+        local_network_output[1]     = network_output[i + j * n_elements + 1 * stride];
+        local_network_output[2]     = network_output[i + j * n_elements + 2 * stride];
+        local_network_output[3]     = network_output[i + j * n_elements + 3 * stride];
+        const NerfCoordinate* input = network_input(i + j * n_elements);
+        vec3 warped_pos             = input->pos.p;
+        vec3 pos                    = unwarp_position(warped_pos, aabb);
+        float dt                    = unwarp_dt(input->dt);
+        local_depth                 = dot(cam_fwd, pos - camera_matrix[3]);
+
+        int slice_index = getSliceIndexFromDepth(local_depth, slice_count, depthNear, depthFar);
+
+#if 1
+        if (debug_pixel.x == resolution.x / 2 && debug_pixel.y == resolution.y / 2)
+            OPENVXL_LOG_VAR4(j, local_depth, slice_index, dt * 1000.f);
+#endif
+
+#if 1
+
+        // only do one slice at a time. once the slice changes we stop processing this ray.
+        if (current_slice_i != slice_index)
+        {
+            if (current_slice_i >= 0)
+            {
+                // finish this slice..
+                rgba[i][current_slice_i]  = local_rgba;
+                depth[i][current_slice_i] = local_depth_max;
+            }
+
+            // advance to next slice.
+            current_slice_i = slice_index;
+            local_rgba      = rgba[i][current_slice_i];
+            local_depth     = depth[i][current_slice_i];
+            local_depth_max = local_depth;
+
+#if 0
+            if (debug_pixel.x == resolution.x / 2 && debug_pixel.y == resolution.y / 2)
+                OPENVXL_LOG_VAR3(j, current_slice_i, local_rgba.a);
+#endif
+        }
+
+        // earlier slices might have reached opacity threshold.
+        // so we don't need to process them anymore.
+        //if (local_rgba.a > 0.75f)
+        //     continue;
+
+        /*
+        // we have to have some criteria for termination, or we will trace to the maxdepth (very slow)!
+        if (local_depth > 2)
+        {
+            //ray_terminated = true;
+            //if (debug_pixel.x == 100 && debug_pixel.y == 100)
+            //    OPENVXL_LOG_VAR2(ray_terminated, local_depth);
+            break;
+        }
+		*/
+        //if (sliceIndex != 1)
+        //	break;
+
+        //if (i == 100)
+        //    OPENVXL_LOG_VAR4(sliceIndex, payload.origin.x, payload.origin.y, payload.origin.z);
+#endif
+
+        float T     = 1.f - local_rgba.a;
+        float alpha = 1.f - __expf(-network_to_density(float(local_network_output[3]), density_activation) * dt);
+
+#if 0
+        if (alpha < 1.0f - min_transmittance)
+        {
+            // this voxel is very transparent.
+            // let's just show the transparent ones.
+            local_rgba = vec4(1, 0, 0, 1);
+            break;
+        }
+#endif
+        // HACK: make every voxel opaque.
+        //alpha = 1.f;
+
+        float weight = alpha * T;
+
+        vec3 rgb = network_to_rgb_vec(local_network_output, rgb_activation);
+
+        // color by the slice...
+        {
+            auto color      = vxl::Vec3f32(rgb.x, rgb.y, rgb.z);
+            auto debugTint  = vxl::Vec3f32(vxl::math::rgbaIntToFloat(vxl::fasthash<uint32_t>(slice_index)));
+            auto debugAlpha = 0.3f;
+            color           = vxl::mix(color, debugTint, debugAlpha);
+
+            rgb = vec3(color[0], color[1], color[2]);
+        }
+
+#if 0
+        if (alpha < 1.0f - min_transmittance)
+        {
+            // this voxel is very transparent.
+            // let's just show the transparent ones.
+            local_rgba = vec4(rgb, 1);
+            break;
+        }
+#endif
+
+        // accumulate transmitted color...
+        local_rgba += vec4(rgb * weight, weight);
+
+        // store the depth value with the maximum weight.
+        if (weight > payload.max_weight)
+        {
+            payload.max_weight = weight;
+            local_depth_max    = local_depth; // eye-space Z
+
+            // get distance from hit pos to camera origin.
+            //local_depth = length(pos - camera_matrix[3]);
+            //printf("local_depth = %f\n", local_depth);
+        }
+
+        // if we reach at least (1-min_transmittance) opacity, then we can stop.
+        // i.e. boost value it to be fully opaque.
+        // NOTE: breaking early will cause ray termination,
+        // but note that the alpha is set, so it gets moved to hit buffer
+
+        if (local_rgba.a > 1.0f - min_transmittance)
+        {
+            local_rgba /= local_rgba.a;
+            //ray_terminated = true;
+
+            local_rgba = vec4(1, 0, 0, 1);
+
+            // we can only terminate if we are on the last slice.
+            if (current_slice_i >= slice_count - 1)
+            {
+                //payload.t = MAX_DEPTH();
+                //OPENVXL_LOG_VAR3(current_slice_i, debug_pixel.x, debug_pixel.y);
+                break;
+            }
+        }
+
+        /*
+        // terminate early if we reach opacity
+        if (slice_i == slice_count - 1 && local_rgba.a > (1.0f - min_transmittance))
+        {
+            local_rgba /= local_rgba.a;
+            ray_terminated = true;
+            break;
+        }
+		*/
+    }
+
+#if 1
+    // if we are not rendering slices, then we can terminate if a ray
+    // breaks because of opacity threshold.
+    // but slices need the data even though the ray terminated.
+
+    if (j < n_steps) //if (ray_terminated)
+    {
+        payload.alive   = false;
+        payload.n_steps = j + current_step;
+    }
+#endif
+
+    // store data in the final processed slice.
+    rgba[i][current_slice_i]  = vec4(1, 0, 1, 1); //local_rgba;
+    depth[i][current_slice_i] = local_depth_max;
 }
 
 __global__ void generate_training_samples_nerf(const uint32_t n_rays,
@@ -1641,13 +2082,518 @@ __global__ void shade_kernel_nerf(const uint32_t n_elements,
                                   bool gbuffer_hard_edges,
                                   mat4x3 camera_matrix,
                                   float depth_scale,
-                                  vec4* __restrict__ rgba,
-                                  float* __restrict__ depth,
+                                  const RaysNerfSoa::ColorType* __restrict__ rgba,
+                                  const RaysNerfSoa::DepthType* __restrict__ depth,
                                   NerfPayload* __restrict__ payloads,
                                   ERenderMode render_mode,
                                   bool train_in_linear_colors,
                                   vec4* __restrict__ frame_buffer,
                                   float* __restrict__ depth_buffer)
+{
+    const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i >= n_elements || render_mode == ERenderMode::Distortion)
+        return;
+    NerfPayload& payload = payloads[i];
+
+    const int slice_i = 0;
+
+    vec4 tmp = rgba[i][slice_i];
+    if (render_mode == ERenderMode::Normals)
+    {
+        vec3 n    = normalize(tmp.xyz());
+        tmp.rgb() = (0.5f * n + 0.5f) * tmp.a;
+    }
+    else if (render_mode == ERenderMode::Cost)
+    {
+        float col = (float) payload.n_steps / 128;
+        tmp       = {col, col, col, 1.0f};
+    }
+    else if (gbuffer_hard_edges && render_mode == ERenderMode::Depth)
+    {
+        tmp.rgb() = vec3(depth[i][slice_i] * depth_scale);
+    }
+    else if (gbuffer_hard_edges && render_mode == ERenderMode::Positions)
+    {
+        vec3 pos  = camera_matrix[3] + payload.dir / dot(payload.dir, camera_matrix[2]) * depth[i][slice_i];
+        tmp.rgb() = (pos - 0.5f) / 2.0f + 0.5f;
+    }
+
+    if (!train_in_linear_colors && (render_mode == ERenderMode::Shade || render_mode == ERenderMode::Slice))
+    {
+        // Accumulate in linear colors
+        tmp.rgb() = srgb_to_linear(tmp.rgb());
+    }
+
+    // HACK: we will bend "slice" render mode to our bidding!
+    if (render_mode == ERenderMode::Slice)
+    {
+        vxl::Vec3f32 color(1, 0, 1);
+
+        // if it is alive or has any visible value...
+        if (payload.alive || tmp.a > 0.f)
+        {
+            {
+                // NOTE: t depends on nearClip, but not farClip! It gors from [nearClip -> render_bbox end?]
+                color = vxl::pseudoTemperature(payload.t);
+                // this ray reached the end, so show black!
+                if (payload.t > MAX_DEPTH() - 0.001f)
+                    color = vxl::Vec3f32(0);
+            }
+            /*
+            {
+                // NOTE: dir is a normalized world-space ray direction
+                color = vxl::Vec3f32{payload.dir.x, payload.dir.y, payload.dir.z};
+            }
+
+            {
+                // NOTE: just normalize by a max step count of 128
+                float unitCost = (float) payload.n_steps / 128;
+                color          = vxl::pseudoTemperature(unitCost);
+            }
+
+            {
+                // just use the composited rgb.
+                color = {tmp.r, tmp.g, tmp.b};
+            }
+			*/
+        }
+
+        tmp = vec4(color[0], color[1], color[2], 1.f);
+    }
+
+    frame_buffer[payload.idx] = tmp + frame_buffer[payload.idx] * (1.0f - tmp.a);
+
+    if (render_mode != ERenderMode::Slice && tmp.a > 0.2f)
+    {
+        depth_buffer[payload.idx] = depth[i][slice_i];
+    }
+}
+
+//----------------------------------------------------------------------------------------------
+// map quilt-tile index to offset angle.
+OPENVXL_CUDA_INLINE vxl::Vec2f32
+    getPlaneOffset(int vi, int vj, int vx, int vy, float halfViewFovX, float halfViewFovY, float focalDistance)
+{
+#if 1
+    // the looking glass quilt format...
+    // 6 7 8
+    // 3 4 5
+    // 0 1 2
+    // where value is xoffset starting from left-most.
+    int n = (vx * vy - 1);
+    if (n == 0)
+        return {0, 0};
+    int v_offset    = vi + vj * vx;
+    float tileU     = (float) v_offset / n;
+    float offAngleX = tileU * (2.0f * halfViewFovX) - halfViewFovX;
+    return {vxl::tan(offAngleX) * focalDistance, 0.f};
+#else
+
+    // just a patch work... but not the format!
+    vxl::swap(vx, vy);
+
+    float offAngleY = 0.f;
+    float offAngleX = 0.f;
+    if (vx > 1)
+    {
+        float tileU = (float) vi / (vx - 1);
+        offAngleX   = tileU * (2.0f * halfViewFovX) - halfViewFovX;
+    }
+    if (vy > 1)
+    {
+        float tileV = (float) vj / (vy - 1);
+        offAngleY   = tileV * (2.0f * halfViewFovY) - halfViewFovY;
+    }
+    // get the 2d offset on the focal plane from the view ray...
+    float offsetX = vxl::tan(offAngleX) * focalDistance;
+    float offsetY = vxl::tan(offAngleY) * focalDistance;
+    return {offsetX, offsetY};
+#endif
+
+    return {0, 0};
+}
+
+__global__ void kernel_slice_blend(uint32_t n_elements,
+                                   ivec2 quiltResolution,
+                                   int vx,
+                                   int vy,
+                                   vec4* __restrict__ frame_buffer,
+                                   float* __restrict__ depth_buffer,
+                                   float alphaThreshold,
+
+                                   float focusDistance, // viewport focusdistance
+                                   float halfViewFovX,  // viewport camera
+                                   float halfViewFovY,  // viewport camera
+                                   float refTanFovX,    // reference camera
+                                   float refTanFovY,    // reference camera
+
+                                   float baseTanFovX,
+                                   float baseTanFovY,
+                                   float refForwardDist,
+                                   float sliceBatchDistance,
+                                   ivec2 sliceResolution,
+                                   int sliceBatchCount,
+                                   int sliceCount,
+                                   const vec4* __restrict__ sliceColorPtr)
+{
+    const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i >= n_elements)
+        return;
+
+    int viewWidth  = quiltResolution.x / vx;
+    int viewHeight = quiltResolution.y / vy;
+    int srcWidth   = sliceResolution.x;
+    int srcHeight  = sliceResolution.y;
+
+    float viewAspect    = (float) viewWidth / viewHeight;
+    float viewAspectInv = 1.f / viewAspect;
+
+    // get quilt coordinates...
+    int quiltX = i % quiltResolution.x;
+    int quiltY = i / quiltResolution.x;
+    int vx_i   = (quiltX / viewWidth);
+    int vy_i   = (quiltY / viewHeight);
+    int view_i = quiltX % viewWidth;
+    int view_j = quiltY % viewHeight;
+
+    // setup slice-plane intersection vars...
+    auto planeOffset = getPlaneOffset(vx_i, vy_i, vx, vy, halfViewFovX, halfViewFovY, focusDistance);
+    float view_u     = ((view_i + 0.5f) / viewWidth) * 2.f - 1.f;  // -1 to +1
+    float view_v     = ((view_j + 0.5f) / viewHeight) * 2.f - 1.f; // -1 to +1
+    float mx         = baseTanFovX * view_u - planeOffset[0] / focusDistance;
+    float my         = baseTanFovY * view_v - planeOffset[1] / focusDistance;
+
+    //float offsetX = focusDistance * vxl::tan(offAngleX);
+    //float offsetY = focusDistance * vxl::tan(offAngleY);
+    //float mx = baseTanFovX * view_u - vxl::tan(offAngleX);
+    //float my = baseTanFovY * view_v - vxl::tan(offAngleY);
+
+    // NOTE: we stored the additive-inverse in framebuffer alpha.
+    vec4 dstColor = frame_buffer[i];
+
+    float accumT    = 1.0f - dstColor.a;
+    vec3 accumColor = dstColor.rgb();
+
+    //frame_buffer[i] = vec4(vec3(view_u, view_v, 0), 1.f);
+    //frame_buffer[i] = vec4(vec3((float) vx_i / vx, (float) vy_i / vy, 0), 1.f);
+    //return;
+#if 1
+    const float kSliceAlphaThreshold = 0.001f;
+
+    for (int k = 0; k < sliceBatchCount && accumT > kSliceAlphaThreshold; ++k)
+    {
+        // get distance to slice...
+        float planeDist = (sliceBatchDistance + 0 * k);
+
+        if (sliceCount == 1)
+            planeDist = focusDistance;
+
+        // get normalized coordinates on plane (-1 to +1)...
+        float base_x = (planeDist - refForwardDist) * refTanFovX;
+        float base_y = (planeDist - refForwardDist) * refTanFovY;
+        float srcU   = (planeOffset[0] + mx * planeDist) / base_x;
+        float srcV   = (planeOffset[1] + my * planeDist) / base_y;
+
+        // fetch source data...
+        int srcImageX = int((srcU * 0.5f + 0.5f) * srcWidth - 0.5f);
+        int srcImageY = int((srcV * 0.5f + 0.5f) * srcHeight - 0.5f);
+        if (srcImageX < 0 || srcImageX >= srcWidth || srcImageY < 0 || srcImageY >= srcHeight)
+            continue;
+
+        //frame_buffer[i] = vec4((float) srcImageX / srcWidth, (float) srcImageY / srcHeight, 0, 1.f);
+        //return;
+
+        int srcSliceOffset = (k * srcWidth * srcHeight);
+        int srcPixelOffset = srcSliceOffset + (srcImageX + srcWidth * srcImageY);
+
+        auto sliceColor = sliceColorPtr[srcPixelOffset];
+        if (sliceColor.a < 0.001f)
+            continue;
+
+        float srcTransmission = 1.0f - sliceColor.a;
+
+        accumColor += accumT * (sliceColor.rgb() * sliceColor.a);
+        accumT *= srcTransmission;
+    }
+
+    frame_buffer[i] = vec4(accumColor, 1.f - accumT);
+    depth_buffer[i] = 0.f;
+
+    //frame_buffer[i] = vec4(vec3((view_i + 0.5f) / viewWidth, (view_j + 0.5f) / viewHeight, 0), 1.f);
+#endif
+}
+
+__global__ void shade_kernel_nerf_accumulate_slice(uint32_t n_elements,
+                                                   uint32_t stride,
+                                                   ivec2 resolution,
+                                                   BoundingBox aabb,
+                                                   int slice_i,
+                                                   float depth_scale,
+                                                   const NerfPayload* __restrict__ payloads,
+                                                   const vec4* __restrict__ rgba,
+                                                   const float* __restrict__ depth,
+
+                                                   PitchedPtr<NerfCoordinate> network_input,
+                                                   const network_precision_t* __restrict__ network_output,
+                                                   uint32_t padded_output_width,
+                                                   ENerfActivation rgb_activation,
+                                                   ENerfActivation density_activation,
+                                                   uint32_t n_steps,
+
+                                                   bool train_in_linear_colors,
+                                                   vec4* __restrict__ frame_buffer,
+                                                   float* __restrict__ depth_buffer)
+{
+    const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i >= n_elements)
+        return;
+    const NerfPayload& payload = payloads[i];
+
+    // scatter coordinates...
+    /*
+    int dstX = payload.idx % resolution.x; // [0 - 256)
+    int dstY = payload.idx / resolution.x;
+    dstX          = vxl::clamp(dstX, 0, resolution.x - 1); // [0 - 255]
+    dstY          = vxl::clamp(dstY, 0, resolution.y - 1);
+    int dstOffset = dstX + dstY * resolution.x;
+	*/
+    int dstOffset = payload.idx;
+
+    if (!rgba)
+    {
+        vec4 local_rgba(0.f, 0, 0, 1);
+
+        for (int j = 0; j < n_steps; ++j)
+        {
+            tvec<network_precision_t, 4> local_network_output;
+            local_network_output[0]     = network_output[i + j * n_elements + 0 * stride];
+            local_network_output[1]     = network_output[i + j * n_elements + 1 * stride];
+            local_network_output[2]     = network_output[i + j * n_elements + 2 * stride];
+            local_network_output[3]     = network_output[i + j * n_elements + 3 * stride];
+            const NerfCoordinate* input = network_input(i + j * n_elements);
+            vec3 warped_pos             = input->pos.p;
+            vec3 pos                    = unwarp_position(warped_pos, aabb);
+
+            float dt    = unwarp_dt(input->dt);
+            float alpha = 1.f - __expf(-network_to_density(float(local_network_output[3]), density_activation) * dt);
+            vec3 rgb    = network_to_rgb_vec(local_network_output, rgb_activation);
+            if (!train_in_linear_colors)
+                rgb = srgb_to_linear(rgb);
+
+            float T = local_rgba.a;
+
+            // skip very transparent pixels in this slice...
+            if (alpha < 0.001f)
+                continue;
+
+            local_rgba.rgb() = rgb * alpha * local_rgba.a;
+            local_rgba.a *= 1.0f - alpha;
+        }
+
+        frame_buffer[dstOffset + 0 * resolution.x * resolution.y] = local_rgba;
+    }
+    else
+    {
+        vec4 srcColor = rgba[i];
+        if (!train_in_linear_colors)
+            srcColor.rgb() = srgb_to_linear(srcColor.rgb());
+
+        {
+            auto color      = vxl::Vec3f32(srcColor.x, srcColor.y, srcColor.z);
+            auto debugTint  = vxl::Vec3f32(vxl::math::rgbaIntToFloat(vxl::fasthash<uint32_t>(slice_i)));
+            auto debugAlpha = 0.0f;
+            color           = vxl::mix(color, debugTint, debugAlpha);
+
+            srcColor.rgb() = vec3(color[0], color[1], color[2]);
+        }
+
+        //vec4 prevColor = frame_buffer[dstOffset];
+
+        //float T    = 1.f - prevColor.a;
+        //float newT = T * (1.f - srcColor.a);
+
+        //vec4 newColor = vec4(prevColor.rgb() + srcColor.rgb() * srcColor.a * T, 1.f - newT);
+
+        frame_buffer[dstOffset] = srcColor;
+    }
+}
+
+__global__ void shade_kernel_nerf_slice(const uint32_t n_elements,
+                                        const uint32_t stride,
+                                        ivec2 resolution,
+                                        int slice_i,
+                                        int mosaicSize,
+                                        bool gbuffer_hard_edges,
+                                        mat4x3 camera_matrix,
+                                        float depth_scale,
+                                        const vec4* __restrict__ rgba,
+                                        const float* __restrict__ depth,
+                                        NerfPayload* __restrict__ payloads,
+                                        ERenderMode render_mode,
+
+                                        BoundingBox aabb,
+                                        PitchedPtr<NerfCoordinate> network_input,
+                                        const network_precision_t* __restrict__ network_output,
+                                        uint32_t padded_output_width,
+                                        ENerfActivation rgb_activation,
+                                        ENerfActivation density_activation,
+                                        uint32_t n_steps,
+
+                                        bool train_in_linear_colors,
+                                        vec4* __restrict__ frame_buffer,
+                                        float* __restrict__ depth_buffer)
+{
+    const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i >= n_elements || render_mode == ERenderMode::Distortion)
+        return;
+    NerfPayload& payload = payloads[i];
+
+    vec4 local_rgba(0.f);
+
+    for (int j = 0; j < n_steps; ++j)
+    {
+        tvec<network_precision_t, 4> local_network_output;
+        local_network_output[0]     = network_output[i + j * n_elements + 0 * stride];
+        local_network_output[1]     = network_output[i + j * n_elements + 1 * stride];
+        local_network_output[2]     = network_output[i + j * n_elements + 2 * stride];
+        local_network_output[3]     = network_output[i + j * n_elements + 3 * stride];
+        const NerfCoordinate* input = network_input(i + j * n_elements);
+        vec3 warped_pos             = input->pos.p;
+        vec3 pos                    = unwarp_position(warped_pos, aabb);
+
+        float dt    = unwarp_dt(input->dt);
+        float alpha = 1.f - __expf(-network_to_density(float(local_network_output[3]), density_activation) * dt);
+        vec3 rgb    = network_to_rgb_vec(local_network_output, rgb_activation);
+
+        //float T = 1.f - local_rgba.a;
+        local_rgba.a     = alpha;
+        local_rgba.rgb() = rgb * alpha;
+        if (!train_in_linear_colors)
+            local_rgba.rgb() = srgb_to_linear(local_rgba.rgb());
+    }
+
+    vec4 srcColor = local_rgba;
+    if (!train_in_linear_colors && render_mode == ERenderMode::Slice)
+        srcColor.rgb() = srgb_to_linear(srcColor.rgb());
+
+    int srcX = payload.idx % resolution.x; // [0 - 256)
+    int srcY = payload.idx / resolution.x;
+
+    float srcU       = fmodf(srcX, resolution.x) / (resolution.x - 1); // [0 - 1)
+    float srcV       = fmodf(srcY, resolution.y) / (resolution.y - 1);
+    int sliceMosaicX = slice_i % mosaicSize; // [0 - 3]
+    int sliceMosaicY = slice_i / mosaicSize;
+    int dstW         = resolution.x / mosaicSize; // 256/4 = 64
+    int dstH         = resolution.y / mosaicSize;
+    int dstX         = dstW * (sliceMosaicX + srcU); // 64 * [0 - 3.9999]
+    int dstY         = dstH * (sliceMosaicY + srcV);
+
+    dstX          = vxl::clamp(dstX, 0, resolution.x - 1); // [0 - 255]
+    dstY          = vxl::clamp(dstY, 0, resolution.y - 1);
+    int dstOffset = dstX + dstY * resolution.x;
+
+    {
+        auto color      = vxl::Vec3f32(srcColor.x, srcColor.y, srcColor.z);
+        auto debugTint  = vxl::Vec3f32(vxl::math::rgbaIntToFloat(vxl::fasthash<uint32_t>(slice_i)));
+        auto debugAlpha = 0.0f;
+        color           = vxl::mix(color, debugTint, debugAlpha);
+
+        srcColor.rgb() = vec3(color[0], color[1], color[2]);
+    }
+
+    frame_buffer[dstOffset] = srcColor; // + frame_buffer[dstOffset] * (1.0f - srcColor.a);
+    //frame_buffer[dstOffset] = vec4(srcU, srcV, 0.f, 1.f);
+    /*
+    if (render_mode != ERenderMode::Slice && srcColor.a > 0.2f)
+    {
+        depth_buffer[payload.idx] = depth[i];
+    }*/
+}
+
+__global__ void shade_kernel_nerf_draw_slices(const uint32_t n_elements,
+                                              ivec2 resolution,
+                                              int slice_count,
+                                              int mosaicSize,
+                                              bool gbuffer_hard_edges,
+                                              mat4x3 camera_matrix,
+                                              float depth_scale,
+                                              const RaysNerfSoa::ColorType* __restrict__ rgba,
+                                              const RaysNerfSoa::DepthType* __restrict__ depth,
+                                              const NerfPayload* __restrict__ payloads,
+                                              ERenderMode render_mode,
+                                              bool train_in_linear_colors,
+                                              vec4* __restrict__ frame_buffer,
+                                              float* __restrict__ depth_buffer)
+{
+    const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i >= n_elements)
+        return;
+
+    int slice_i                = i % slice_count;
+    int ray_i                  = i / slice_count;
+    const NerfPayload& payload = payloads[ray_i];
+
+    vec4 srcColor = rgba[ray_i][slice_i];
+    if (!train_in_linear_colors && render_mode == ERenderMode::Slice)
+        srcColor.rgb() = srgb_to_linear(srcColor.rgb());
+
+    int srcX = payload.idx % resolution.x; // [0 - 256)
+    int srcY = payload.idx / resolution.x;
+
+    float srcU       = fmodf(srcX, resolution.x) / (resolution.x - 1); // [0 - 1)
+    float srcV       = fmodf(srcY, resolution.y) / (resolution.y - 1);
+    int sliceMosaicX = slice_i % mosaicSize; // [0 - 3]
+    int sliceMosaicY = slice_i / mosaicSize;
+    int dstW         = resolution.x / mosaicSize; // 256/4 = 64
+    int dstH         = resolution.y / mosaicSize;
+    int dstX         = dstW * (sliceMosaicX + srcU); // 64 * [0 - 3.9999]
+    int dstY         = dstH * (sliceMosaicY + srcV);
+
+    dstX          = vxl::clamp(dstX, 0, resolution.x - 1); // [0 - 255]
+    dstY          = vxl::clamp(dstY, 0, resolution.y - 1);
+    int dstOffset = dstX + dstY * resolution.x;
+
+    {
+        auto color      = vxl::Vec3f32(srcColor.x, srcColor.y, srcColor.z);
+        auto debugTint  = vxl::Vec3f32(vxl::math::rgbaIntToFloat(vxl::fasthash<uint32_t>(slice_i)));
+        auto debugAlpha = 0.0f;
+        color           = vxl::mix(color, debugTint, debugAlpha);
+
+        srcColor.rgb() = vec3(color[0], color[1], color[2]);
+    }
+
+    srcColor.a              = 1.0f;
+    frame_buffer[dstOffset] = srcColor; // + frame_buffer[dstOffset] * (1.0f - srcColor.a);
+    //frame_buffer[dstOffset] = vec4(mosaicU, mosaicV, 0.f, 1.f);
+
+    //frame_buffer[dstOffset] = vec4(srcColor.a,srcColor.a,srcColor.a,1.0f);
+
+    if (srcColor.a > 0.2f)
+    {
+        depth_buffer[payload.idx] = depth[ray_i][slice_i];
+    }
+
+    // HACK: raw the center pixel..
+    int centerX                                            = dstW * (sliceMosaicX + 0.5f);
+    int centerY                                            = dstH * (sliceMosaicY + 0.5f);
+    frame_buffer[(centerX) + (centerY) *resolution.x]      = vec4(1, 1, 1, 1);
+    frame_buffer[(centerX) + (centerY + 1) * resolution.x] = vec4(0, 0, 0, 1);
+    frame_buffer[(centerX) + (centerY - 1) * resolution.x] = vec4(0, 0, 0, 1);
+    frame_buffer[(centerX - 1) + (centerY) *resolution.x]  = vec4(0, 0, 0, 1);
+    frame_buffer[(centerX + 1) + (centerY) *resolution.x]  = vec4(0, 0, 0, 1);
+}
+
+__global__ void shade_kernel_nerf_2d(const uint32_t n_elements,
+                                     bool gbuffer_hard_edges,
+                                     mat4x3 camera_matrix,
+                                     float depth_scale,
+                                     const vec4* __restrict__ rgba,
+                                     const float* __restrict__ depth,
+                                     NerfPayload* __restrict__ payloads,
+                                     ERenderMode render_mode,
+                                     bool train_in_linear_colors,
+                                     vec4* __restrict__ frame_buffer,
+                                     float* __restrict__ depth_buffer)
 {
     const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
     if (i >= n_elements || render_mode == ERenderMode::Distortion)
@@ -1690,37 +2636,96 @@ __global__ void shade_kernel_nerf(const uint32_t n_elements,
 }
 
 __global__ void compact_kernel_nerf(const uint32_t n_elements,
-                                    vec4* src_rgba,
-                                    float* src_depth,
-                                    NerfPayload* src_payloads,
-                                    vec4* dst_rgba,
-                                    float* dst_depth,
+                                    const RaysNerfSoa::ColorType* src_rgba,
+                                    const RaysNerfSoa::DepthType* src_depth,
+                                    const NerfPayload* src_payloads,
+                                    RaysNerfSoa::ColorType* dst_rgba,
+                                    RaysNerfSoa::DepthType* dst_depth,
                                     NerfPayload* dst_payloads,
-                                    vec4* dst_final_rgba,
-                                    float* dst_final_depth,
+                                    RaysNerfSoa::ColorType* dst_final_rgba,
+                                    RaysNerfSoa::DepthType* dst_final_depth,
                                     NerfPayload* dst_final_payloads,
-                                    uint32_t* counter,
+                                    uint32_t* aliveCounter,
                                     uint32_t* finalCounter)
 {
     const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
     if (i >= n_elements)
         return;
 
-    NerfPayload& src_payload = src_payloads[i];
+    const NerfPayload& src_payload = src_payloads[i];
 
     if (src_payload.alive)
     {
-        uint32_t idx      = atomicAdd(counter, 1);
+        uint32_t idx      = atomicAdd(aliveCounter, 1);
         dst_payloads[idx] = src_payload;
-        dst_rgba[idx]     = src_rgba[i];
-        dst_depth[idx]    = src_depth[i];
+
+        for (int slice_i = 0; slice_i < RaysNerfSoa::ColorType::kSize; ++slice_i)
+        {
+            dst_rgba[idx][slice_i]  = src_rgba[i][slice_i];
+            dst_depth[idx][slice_i] = src_depth[i][slice_i];
+        }
     }
-    else if (src_rgba[i].a > 0.001f)
+    else if (src_rgba[i][0].a > 0.001f)
     {
+        // the ray is finished!
+        // so if the ray is not alive anymore and if the ray's opacity is enough,
+        // then put this in the "hit" buffer.
+
         uint32_t idx            = atomicAdd(finalCounter, 1);
         dst_final_payloads[idx] = src_payload;
-        dst_final_rgba[idx]     = src_rgba[i];
-        dst_final_depth[idx]    = src_depth[i];
+
+        for (int slice_i = 0; slice_i < RaysNerfSoa::ColorType::kSize; ++slice_i)
+        {
+            dst_final_rgba[idx][slice_i]  = src_rgba[i][slice_i];
+            dst_final_depth[idx][slice_i] = src_depth[i][slice_i];
+        }
+    }
+}
+
+__global__ void debug_rays_kernel(const uint32_t n_elements,
+                                  float plane_z,
+                                  const RaysNerfSoa::ColorType* src_rgba,
+                                  const RaysNerfSoa::DepthType* src_depth,
+                                  const NerfPayload* src_payloads,
+                                  RaysNerfSoa::ColorType* dst_final_rgba,
+                                  RaysNerfSoa::DepthType* dst_final_depth,
+                                  NerfPayload* dst_final_payloads,
+                                  uint32_t* counter,
+                                  uint32_t* finalCounter)
+{
+    const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i >= n_elements)
+        return;
+
+    const NerfPayload& src_payload = src_payloads[i];
+
+    {
+        // finish the ray.
+        // so if the ray is not alive anymore and if the ray's opacity is enough,
+        // then put this in the "hit" buffer.
+
+        uint32_t idx            = atomicAdd(finalCounter, 1);
+        dst_final_payloads[idx] = src_payload;
+        //dst_final_payloads[idx].alive = false;
+
+        // HACK: for slice just set it back to the plane-z.
+        {
+            float n = length(dst_final_payloads[idx].dir);
+            //dst_final_payloads.origin = ray.o;
+            //dst_final_payloads.dir = (1.0f / n) * ray.d;
+            dst_final_payloads[idx].t = vxl::abs(plane_z) * n;
+        }
+
+        for (int slice_i = 0; slice_i < RaysNerfSoa::ColorType::kSize; ++slice_i)
+        {
+            dst_final_rgba[idx][slice_i]  = src_rgba[i][slice_i];
+            dst_final_depth[idx][slice_i] = src_depth[i][slice_i];
+        }
+
+        if (src_payload.t == MAX_DEPTH())
+        {
+            OPENVXL_LOG_VAR(src_payload.t);
+        }
     }
 }
 
@@ -1804,6 +2809,7 @@ __global__ void init_rays_with_payload_kernel_nerf(uint32_t sample_index,
     }
 
     // if we specified a plane_z then set the ray to start there...
+    // we terminate the ray to ensure it immediately get put in the rays_hit buffer.
     if (plane_z < 0)
     {
         float n           = length(ray.d);
@@ -1852,6 +2858,8 @@ __global__ void init_rays_with_payload_kernel_nerf(uint32_t sample_index,
     if (!render_aabb.contains(render_aabb_to_local * ray(t)))
     {
         payload.origin = ray.o;
+        payload.t      = t;   // for debugging.
+        payload.idx    = idx; // for debugging.
         payload.alive  = false;
         return;
     }
@@ -1941,6 +2949,7 @@ void Testbed::NerfTracer::init_rays_from_camera(uint32_t sample_index,
                                                 uint32_t padded_output_width,
                                                 uint32_t n_extra_dims,
                                                 const ivec2& resolution,
+                                                int slice_count,
                                                 const vec2& focal_length,
                                                 const mat4x3& camera_matrix0,
                                                 const mat4x3& camera_matrix1,
@@ -1969,10 +2978,9 @@ void Testbed::NerfTracer::init_rays_from_camera(uint32_t sample_index,
 {
     // Make sure we have enough memory reserved to render at the requested resolution
     size_t n_pixels = (size_t) resolution.x * resolution.y;
-    int slice_count = 4;
 
     // ensure we have memory for our ray data (the payload)...
-    enlarge(n_pixels, padded_output_width, n_extra_dims, slice_count, stream);
+    enlarge(n_pixels, padded_output_width, n_extra_dims, 1, stream);
 
     // build the rays...
     const dim3 threads = {16, 8, 1};
@@ -2004,32 +3012,44 @@ void Testbed::NerfTracer::init_rays_from_camera(uint32_t sample_index,
 
     m_n_rays_initialized = resolution.x * resolution.y;
 
-    CUDA_CHECK_THROW(cudaMemsetAsync(m_rays[0].rgba, 0, slice_count * m_n_rays_initialized * sizeof(vec4), stream));
-    CUDA_CHECK_THROW(cudaMemsetAsync(m_rays[0].depth, 0, slice_count * m_n_rays_initialized * sizeof(float), stream));
+    // CAVEAT: clear the original color+depth of the first (double-buffered) ray framebuffer.
+    CUDA_CHECK_THROW(cudaMemsetAsync(m_rays[0].rgba, 0, m_n_rays_initialized * sizeof(vec4), stream));
+    CUDA_CHECK_THROW(cudaMemsetAsync(m_rays[0].depth, 0, m_n_rays_initialized * sizeof(float), stream));
 
-    // find a suitable first position in the volume...
-    // when this function is over, the ray will either have terminated, or it will
-    // at the first occupied voxel based on the density grid.
-    linear_kernel(advance_pos_nerf_kernel,
-                  0,
-                  stream,
-                  m_n_rays_initialized,
-                  render_aabb,
-                  render_aabb_to_local,
-                  camera_matrix1[2],
-                  focal_length,
-                  sample_index,
-                  m_rays[0].payload,
-                  grid,
-                  (show_accel >= 0) ? show_accel : 0,
-                  max_mip,
-                  cone_angle_constant);
+    if (plane_z < 0)
+    {
+        // HACK: when in original slice rendermode, we negate the plane_z.
+        // we are rendering in original 2d slice mode. so do not bother to trace forward in the volume.
+        // we already terminated the rays.
+    }
+    else
+    {
+        // find a suitable first position in the volume...
+        // when this function is over, the ray will either have terminated, or it will
+        // at the first occupied voxel based on the density grid.
+        linear_kernel(advance_pos_nerf_kernel,
+                      0,
+                      stream,
+                      m_n_rays_initialized,
+                      render_aabb,
+                      render_aabb_to_local,
+                      camera_matrix1[2],
+                      focal_length,
+                      sample_index,
+                      m_rays[0].payload,
+                      grid,
+                      (show_accel >= 0) ? show_accel : 0,
+                      max_mip,
+                      cone_angle_constant);
+    }
 }
 
 uint32_t Testbed::NerfTracer::trace(const std::shared_ptr<NerfNetwork<network_precision_t>>& network,
                                     const BoundingBox& render_aabb,
                                     const mat3& render_aabb_to_local,
                                     const BoundingBox& train_aabb,
+                                    const ivec2& resolution,
+                                    int slice_count,
                                     const vec2& focal_length,
                                     float cone_angle_constant,
                                     const uint8_t* grid,
@@ -2067,6 +3087,7 @@ uint32_t Testbed::NerfTracer::trace(const std::shared_ptr<NerfNetwork<network_pr
         ++double_buffer_index;
 
         // Compact rays that did not diverge yet.
+        // also, any terminated rays are moved into the rays_hit buffer, and the hit_counter incremented.
         {
             CUDA_CHECK_THROW(cudaMemsetAsync(m_alive_counter, 0, sizeof(uint32_t), stream));
             linear_kernel(compact_kernel_nerf,
@@ -2091,6 +3112,7 @@ uint32_t Testbed::NerfTracer::trace(const std::shared_ptr<NerfNetwork<network_pr
 
         if (n_alive == 0)
         {
+            // break if all rays have terminated.
             break;
         }
 
@@ -2121,6 +3143,7 @@ uint32_t Testbed::NerfTracer::trace(const std::shared_ptr<NerfNetwork<network_pr
                       max_mip,
                       cone_angle_constant,
                       extra_dims_gpu);
+
         uint32_t n_elements = next_multiple(n_alive * n_steps_between_compaction, BATCH_SIZE_GRANULARITY);
         GPUMatrix<float> positions_matrix(
             (float*) m_network_input, (sizeof(NerfCoordinate) + extra_stride) / sizeof(float), n_elements);
@@ -2146,6 +3169,8 @@ uint32_t Testbed::NerfTracer::trace(const std::shared_ptr<NerfNetwork<network_pr
                       n_alive,
                       n_elements,
                       i,
+                      resolution,
+                      slice_count,
                       train_aabb,
                       glow_y_cutoff,
                       glow_mode,
@@ -2167,9 +3192,201 @@ uint32_t Testbed::NerfTracer::trace(const std::shared_ptr<NerfNetwork<network_pr
                       min_transmittance);
 
         i += n_steps_between_compaction;
+
+        //break;
     }
 
     uint32_t n_hit;
+    CUDA_CHECK_THROW(cudaMemcpyAsync(&n_hit, m_hit_counter, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK_THROW(cudaStreamSynchronize(stream));
+    return n_hit;
+}
+
+uint32_t Testbed::NerfTracer::debug_rays(uint32_t n_alive, const RaysNerfSoa& rays, cudaStream_t stream, float plane_z)
+{
+    CUDA_CHECK_THROW(cudaMemsetAsync(m_alive_counter, 0, sizeof(uint32_t), stream));
+    linear_kernel(debug_rays_kernel,
+                  0,
+                  stream,
+                  n_alive,
+                  plane_z,
+                  rays.rgba,
+                  rays.depth,
+                  rays.payload,
+                  m_rays_hit.rgba,
+                  m_rays_hit.depth,
+                  m_rays_hit.payload,
+                  m_alive_counter,
+                  m_hit_counter);
+    CUDA_CHECK_THROW(cudaMemcpyAsync(&n_alive, m_alive_counter, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
+#if 1
+    // how many rays have finished. i.e. are terminated and have some opacity
+    uint32_t n_hit = 0;
+    CUDA_CHECK_THROW(cudaMemcpyAsync(&n_hit, m_hit_counter, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
+#endif
+    CUDA_CHECK_THROW(cudaStreamSynchronize(stream));
+
+    return n_alive;
+}
+
+uint32_t Testbed::NerfTracer::traceSlices(const std::shared_ptr<NerfNetwork<network_precision_t>>& network,
+                                          const BoundingBox& render_aabb,
+                                          const mat3& render_aabb_to_local,
+                                          const BoundingBox& train_aabb,
+                                          const ivec2& resolution,
+                                          int slice_count,
+                                          const vec2& focal_length,
+                                          float cone_angle_constant,
+                                          const uint8_t* grid,
+                                          const mat4x3& camera_matrix,
+                                          float depth_scale,
+                                          ENerfActivation rgb_activation,
+                                          ENerfActivation density_activation,
+                                          float depthNear,
+                                          uint32_t max_mip,
+                                          float min_transmittance,
+                                          const float* extra_dims_gpu,
+                                          cudaStream_t stream)
+{
+    if (m_n_rays_initialized == 0)
+    {
+        return 0;
+    }
+
+    // CAVEAT: remember to zero the accumulated hit counter...
+    CUDA_CHECK_THROW(cudaMemsetAsync(m_hit_counter, 0, sizeof(uint32_t), stream));
+
+    uint32_t n_hit   = 0;
+    uint32_t n_alive = m_n_rays_initialized;
+    // m_n_rays_initialized = 0;
+
+    uint32_t i                   = 1;
+    uint32_t double_buffer_index = 0;
+    while (i < MARCH_ITER)
+    {
+        RaysNerfSoa& rays_current = m_rays[(double_buffer_index + 1) % 2];
+        RaysNerfSoa& rays_tmp     = m_rays[double_buffer_index % 2];
+        ++double_buffer_index;
+#if 0
+        if (debug_rays(n_alive, rays_tmp, stream) == 0)
+            break;
+#endif
+        // Compact rays that did not diverge yet.
+        // also, any terminated rays are moved into the rays_hit buffer, and the hit_counter incremented.
+        {
+            CUDA_CHECK_THROW(cudaMemsetAsync(m_alive_counter, 0, sizeof(uint32_t), stream));
+            linear_kernel(compact_kernel_nerf,
+                          0,
+                          stream,
+                          n_alive,
+                          rays_tmp.rgba,
+                          rays_tmp.depth,
+                          rays_tmp.payload,
+                          rays_current.rgba,
+                          rays_current.depth,
+                          rays_current.payload,
+                          m_rays_hit.rgba,
+                          m_rays_hit.depth,
+                          m_rays_hit.payload,
+                          m_alive_counter,
+                          m_hit_counter);
+            CUDA_CHECK_THROW(
+                cudaMemcpyAsync(&n_alive, m_alive_counter, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK_THROW(cudaStreamSynchronize(stream));
+        }
+
+        if (n_alive == 0)
+        {
+            break;
+        }
+
+#if 1
+        if (debug_rays(n_alive, rays_current, stream, depthNear) == 0)
+            break;
+#endif
+#if 0
+        // now advance the ray by n steps in one go...
+
+        // generate inference network inputs for all the alive rays, for a count of steps.
+
+        // Want a large number of queries to saturate the GPU and to ensure compaction doesn't happen toooo frequently.
+        uint32_t target_n_queries           = 2 * 1024 * 1024;
+        uint32_t n_steps_between_compaction = clamp(target_n_queries / n_alive,
+                                                    (uint32_t) MIN_STEPS_INBETWEEN_COMPACTION,
+                                                    (uint32_t) MAX_STEPS_INBETWEEN_COMPACTION);
+
+        uint32_t extra_stride = network->n_extra_dims() * sizeof(float);
+        PitchedPtr<NerfCoordinate> input_data((NerfCoordinate*) m_network_input, 1, 0, extra_stride);
+        linear_kernel(generate_next_nerf_network_inputs,
+                      0,
+                      stream,
+                      n_alive,
+                      render_aabb,
+                      render_aabb_to_local,
+                      train_aabb,
+                      focal_length,
+                      camera_matrix[2],
+                      rays_current.payload,
+                      input_data,
+                      n_steps_between_compaction,
+                      grid,
+                      (show_accel >= 0) ? show_accel : 0,
+                      max_mip,
+                      cone_angle_constant,
+                      extra_dims_gpu);
+
+        uint32_t n_elements = next_multiple(n_alive * n_steps_between_compaction, BATCH_SIZE_GRANULARITY);
+        GPUMatrix<float> positions_matrix(
+            (float*) m_network_input, (sizeof(NerfCoordinate) + extra_stride) / sizeof(float), n_elements);
+        GPUMatrix<network_precision_t, RM> rgbsigma_matrix(
+            (network_precision_t*) m_network_output, network->padded_output_width(), n_elements);
+        network->inference_mixed_precision(stream, positions_matrix, rgbsigma_matrix);
+
+        if (render_mode == ERenderMode::Normals)
+        {
+            network->input_gradient(stream, 3, positions_matrix, positions_matrix);
+        }
+        else if (render_mode == ERenderMode::EncodingVis)
+        {
+            network->visualize_activation(stream, visualized_layer, visualized_dim, positions_matrix, positions_matrix);
+        }
+
+        // composite all inference steps into the ray's rgba+depth...
+        // TODO: composite into different slices for the ray.
+        // this means the ray payload needs space for each rgba slice.
+        linear_kernel(composite_kernel_nerf_slice,
+                      0,
+                      stream,
+                      n_alive,
+                      n_elements,
+                      i,
+                      resolution,
+                      slice_count,
+                      train_aabb,
+                      camera_matrix,
+                      focal_length,
+                      depth_scale,
+                      rays_current.rgba,
+                      rays_current.depth,
+                      rays_current.payload,
+                      input_data,
+                      m_network_output,
+                      network->padded_output_width(),
+                      n_steps_between_compaction,
+                      grid,
+                      rgb_activation,
+                      density_activation,
+                      min_transmittance);
+
+        i += n_steps_between_compaction;
+
+#if 0
+        if (debug_rays(n_alive, rays_current, stream) == 0)
+            break;
+#endif
+#endif
+    }
+
     CUDA_CHECK_THROW(cudaMemcpyAsync(&n_hit, m_hit_counter, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK_THROW(cudaStreamSynchronize(stream));
     return n_hit;
@@ -2184,16 +3401,16 @@ void Testbed::NerfTracer::enlarge(size_t n_elements,
     n_elements        = next_multiple(n_elements, size_t(BATCH_SIZE_GRANULARITY));
     size_t num_floats = sizeof(NerfCoordinate) / sizeof(float) + n_extra_dims;
     auto scratch =
-        allocate_workspace_and_distribute<vec4,
-                                          float,
+        allocate_workspace_and_distribute<RaysNerfSoa::ColorType,
+                                          RaysNerfSoa::DepthType,
                                           NerfPayload, // m_rays[0]
 
-                                          vec4,
-                                          float,
+                                          RaysNerfSoa::ColorType,
+                                          RaysNerfSoa::DepthType,
                                           NerfPayload, // m_rays[1]
 
-                                          vec4,
-                                          float,
+                                          RaysNerfSoa::ColorType,
+                                          RaysNerfSoa::DepthType,
                                           NerfPayload, // m_rays_hit
 
                                           network_precision_t,
@@ -2267,6 +3484,74 @@ void Testbed::Nerf::Training::update_extra_dims()
                                      cudaMemcpyHostToDevice));
 }
 
+vec3 interpolate2(float xb, float yb, int ni, int nj, int nx, int ny)
+{
+    float p = (float) ni / (nx - 1);
+    float q = (float) nj / (ny - 1);
+
+    vec3 uv(0, 0, 1);
+    uv.x = (p) * (xb * 2) - (xb);
+    uv.y = (q) * (yb * 2) - (yb);
+    return uv;
+}
+
+std::vector<vec3> display_space_ro(float xb, float yb, int nx, int ny)
+{
+    std::vector<vec3> result;
+    result.resize(nx * ny);
+
+    //torch.linspace(-xb/2, xb/2, nx, dtype=torch.float32, device=device),
+    //torch.linspace(yb/2, -yb/2, ny, dtype=torch.float32, device=device),
+
+    for (int x = 0; x < nx; ++x)
+    {
+        for (int y = 0; y < ny; ++y)
+        {
+            result[x + y * nx] = interpolate2(xb, -yb, x, y, nx, ny);
+        }
+    }
+
+    return result;
+}
+
+vec3 get_display_space_rd(float theta_tot_x, float theta_tot_y, int ni, int nj, int nx, int ny)
+{
+    float half_x = tanf(vxl::radians(theta_tot_x / 2));
+    float half_y = tanf(vxl::radians(theta_tot_y / 2));
+
+    vec3 uv(0, 0, 1);
+    uv.x = ((float) ni / (nx - 1)) * (half_x * 2) - (half_x);
+    uv.y = -(((float) nj / (ny - 1)) * (half_y * 2) - (half_x));
+    return uv;
+}
+
+std::vector<vec3> display_space_rd(float theta_tot_x, float theta_tot_y, int nx, int ny)
+{
+    std::vector<vec3> result;
+    result.resize(nx * ny);
+
+    float half_x = tanf(vxl::radians(theta_tot_x / 2));
+    float half_y = tanf(vxl::radians(theta_tot_y / 2));
+
+    // torch.linspace(-half_x, half_x, vx, dtype = torch.float32, device = device),
+    //torch.linspace(-half_y, half_y, vy, dtype = torch.float32, device = device),
+
+    vec3 uv(0, 0, 1);
+
+    for (int x = 0; x < nx; ++x)
+    {
+        uv.x = ((float) x / (nx - 1)) * (half_x * 2) - (half_x);
+        for (int y = 0; y < ny; ++y)
+        {
+            uv.y = ((float) y / (ny - 1)) * (half_y * 2) - (half_y);
+
+            result[x + y * nx] = uv;
+        }
+    }
+
+    return result;
+}
+
 void Testbed::render_nerf(cudaStream_t stream,
                           CudaDevice& device,
                           const CudaRenderBufferView& render_buffer,
@@ -2280,11 +3565,18 @@ void Testbed::render_nerf(cudaStream_t stream,
                           const Foveation& foveation,
                           int visualized_dimension)
 {
-    float plane_z = m_slice_plane_z + m_scale;
+    float plane_z       = m_slice_plane_z + m_scale;
+    float aperture_size = m_aperture_size;
+#if 1
+
+    // HACK: flip this to negative to signify it is a slice plane!
     if (m_render_mode == ERenderMode::Slice)
     {
-        plane_z = -plane_z;
+        //plane_z = -plane_z; // force it into 2d mode where we don't advance the ray or have aperture > 0!
+
+        aperture_size = 0.f;
     }
+#endif
 
     ERenderMode render_mode = visualized_dimension > -1 ? ERenderMode::EncodingVis : m_render_mode;
 
@@ -2303,6 +3595,178 @@ void Testbed::render_nerf(cudaStream_t stream,
     Lens lens = m_nerf.render_with_lens_distortion ? m_nerf.render_lens : Lens{};
 
     auto resolution = render_buffer.resolution;
+    int slice_count = 32; //std::min(4, RaysNerfSoa::ColorType::kSize);
+
+#if 0
+    if (false && render_mode == ERenderMode::Slice)
+    {
+        int nx = 16;
+        int ny = 16;
+        int nz = 4;
+
+        int vx = 8;
+        int vy = 8;
+
+        float xb = 0.5;
+        float yb = 0.5;
+        float zb = 0.5;
+
+        float theta_tot_x = 20.f;
+        float theta_tot_y = 20.f;
+
+        float half_x = tanf(vxl::radians(theta_tot_x / 2));
+        float half_y = tanf(vxl::radians(theta_tot_y / 2));
+
+        vec3 bboxPos(0.f);
+        mat4 bboxRotMat;
+
+        // sweeping plane
+        float forward_step_size = zb / nz;
+
+        float alpha_thres = 0.0001f;
+
+        std::vector<float> sweeping_alpha(nx * ny);
+        std::vector<vec3> sweeping_rgb(nx * ny);
+        std::vector<float> sweeping_T(nx * ny);
+        std::vector<int> sampleIndices(nx * ny);
+        std::vector<int> newSampleIndices(nx * ny);
+
+        {
+            int vi       = 0;
+            int vj       = 0;
+            auto base_rd = interpolate2(half_x, half_y, vi, vj, vx, vy);
+
+            // define quilt re - sampling pattern on the sweeping plane...
+
+            const float x_fullangle = 2 * vxl::tan(vxl::radians(theta_tot_x / 2)) * forward_step_size;
+            const float y_fullangle = 2 * vxl::tan(vxl::radians(theta_tot_y / 2)) * forward_step_size;
+            const float x_per_pix   = xb / (nx - 1);
+            const float y_per_pix   = yb / (ny - 1);
+            const float x_per_angle = x_fullangle / (vx - 1);
+            const float dx          = -x_per_angle / x_per_pix;
+            const float y_per_angle = y_fullangle / (vy - 1);
+            const float dy          = y_per_angle / y_per_pix;
+
+            float now_dx = -dx * (nz / 2);
+            float now_dy = -dy * (nz / 2);
+
+            for (int slice_i = 0; slice_i < nz; ++slice_i)
+            {
+                // Move sweeping plane forward
+                if (slice_i == 0)
+                    continue;
+
+                const vec3 sweeping_rd_c = vec3(0, 0, -1);
+                const vec3 sweeping_rd   = /*bboxRotMat * */ sweeping_rd_c;
+                const vec3 sweeping_step = sweeping_rd * forward_step_size;
+                const float offsetz      = -sweeping_rd_c.z * (forward_step_size * nz / 2);
+
+                vec3 slice_pos = vec3(0, 0, offsetz) + bboxPos;
+
+                sampleIndices.resize(nx * ny);
+                for (int i = 0; i < nx * ny; ++i)
+                    sampleIndices[i] = i;
+
+                // for each pixel in the sweep plane...
+                for (int nj = 0; nj < ny; ++nj)
+                {
+                    for (int ni = 0; ni < nx; ++ni)
+                    {
+                        int pixel_i = ni + nj * nx;
+
+                        // get the ray origin for this pixel...
+                        auto base_ro     = interpolate2(xb / 2, -yb / 2, ni, nj, nx, ny);
+                        base_ro.z        = 0;
+                        vec3 sweeping_ro = /*bboxRotMat **/ base_ro + slice_pos;
+
+                        OPENVXL_LOG_VAR2(ni, sweeping_ro.x);
+                        // transmission buffer.
+                        //float sweeping_T    = torch.ones([self.ny, self.nx, 1], device = device)
+
+                        //quilt_T = torch.ones([self.vy, self.vx, self.ny, self.nx], device = device)
+                        // //quilt_color =torch.zeros([self.vy, self.vx, self.ny, self.nx, 3], device = device)
+
+                        // filter to keep points...
+                        {
+                            newSampleIndices.clear();
+                            for (int i = 0; i < sampleIndices.size(); ++i)
+                            {
+                                if (sweeping_T[pixel_i] > alpha_thres)
+                                {
+                                    newSampleIndices.push_back(ni + nj * nx);
+                                }
+                            }
+
+                            // filter by density at all points...
+                            for (int i = 0; i < newSampleIndices.size(); ++i)
+                            {
+                                /*
+                                for (density_fn : pipeline.model.density_fns)
+                                {
+                                    if (len(pt) == 0)
+                                        break;
+                                    density = density_fn(pt);
+                                    alphas  = 1 - torch.exp(-forward_step_size * density);
+
+                                    sel     = torch.where(alphas.squeeze() > self.alpha_thres)[0];
+                                    pt      = pt[sel];
+                                    pt_ii   = pt_ii[sel];
+                                    pt_jj   = pt_jj[sel];
+                                }
+								*/
+                            }
+
+                            sampleIndices = newSampleIndices;
+                        }
+
+                        if (sampleIndices.size() == 0)
+                            continue;
+
+                        // Sample the remaining points...
+                        vec3 rgb;
+                        float alpha = 0;
+
+                        /*
+                        auto ray_samples = RaySamples(frustums = Frustums(
+                                origins = pt, directions = sweeping_rd, starts = 0, ends = 0, pixel_area = 1, ),
+                            camera_indices = torch.zeros([1], dtype = torch.int64), );
+
+						float density, embedding = pipeline.model.field.get_density(ray_samples);
+						alpha = 1 - exp(-forward_step_size * density);
+
+						if ((alpha <= self.alpha_thres).all())
+                            continue;
+						else if(self.sweep_T_filtering)
+							sweeping_T[pixel_i] *= (1 - alpha);
+						*/
+
+                        // sample color into all the sample points.
+                        //rgb = pipeline.model.field.get_outputs(ray_samples, density_embedding = embedding)[FieldHeadNames.RGB];
+
+                        sweeping_alpha[pixel_i] = alpha; //.squeeze();
+                        sweeping_rgb[pixel_i]   = alpha * rgb;
+                    }
+                }
+
+                // no we have the slice... we can render it for all views.
+                /*
+				swizzle_alpha_comp_cuda.forward_warping(plane_alpha = sweeping_alpha,
+                                                        plane_color = sweeping_rgb,
+                                                        quilt_T     = quilt_T,
+                                                        quilt_color = quilt_color,
+                                                        dx          = now_dx,
+                                                        dy          = now_dy,
+                                                        alpha_thres = self.alpha_thres)*/
+
+                now_dx += dx;
+                now_dy += dy;
+                slice_pos.z -= forward_step_size;
+            }
+        }
+
+        return;
+    }
+#endif
 
     // create the camera rays...
     tracer.init_rays_from_camera(
@@ -2310,6 +3774,7 @@ void Testbed::render_nerf(cudaStream_t stream,
         nerf_network->padded_output_width(),
         nerf_network->n_extra_dims(),
         render_buffer.resolution,
+        slice_count,
         focal_length,
         camera_matrix0,
         camera_matrix1,
@@ -2321,7 +3786,7 @@ void Testbed::render_nerf(cudaStream_t stream,
         m_render_aabb_to_local,
         m_render_near_distance,
         plane_z,
-        m_aperture_size,
+        aperture_size,
         foveation,
         lens,
         m_envmap.inference_view(),
@@ -2339,7 +3804,7 @@ void Testbed::render_nerf(cudaStream_t stream,
     float depth_scale = 1.0f / m_nerf.training.dataset.scale;
 
     // render_2d is true if we are rendering volume, but instead making a diagnostic "flat" image.
-    bool render_2d = m_render_mode == ERenderMode::Slice || m_render_mode == ERenderMode::Distortion;
+    bool render_2d = /*m_render_mode == ERenderMode::Slice || */ m_render_mode == ERenderMode::Distortion;
 
     uint32_t n_hit;
     if (render_2d)
@@ -2352,6 +3817,8 @@ void Testbed::render_nerf(cudaStream_t stream,
                              m_render_aabb,
                              m_render_aabb_to_local,
                              m_aabb,
+                             resolution,
+                             slice_count,
                              focal_length,
                              m_nerf.cone_angle_constant,
                              density_grid_bitfield,
@@ -2370,6 +3837,7 @@ void Testbed::render_nerf(cudaStream_t stream,
                              extra_dims_gpu,
                              stream);
     }
+
     RaysNerfSoa& rays_hit = render_2d ? tracer.rays_init() : tracer.rays_hit();
 
     if (render_2d)
@@ -2411,7 +3879,7 @@ void Testbed::render_nerf(cudaStream_t stream,
                 stream, m_visualized_layer, visualized_dimension, positions_matrix, rgbsigma_matrix);
         }
 
-        linear_kernel(shade_kernel_nerf,
+        linear_kernel(shade_kernel_nerf_2d,
                       0,
                       stream,
                       n_hit,
@@ -2425,23 +3893,54 @@ void Testbed::render_nerf(cudaStream_t stream,
                       m_nerf.training.linear_colors,
                       render_buffer.frame_buffer,
                       render_buffer.depth_buffer);
+
         return;
     }
 
-    linear_kernel(shade_kernel_nerf,
-                  0,
-                  stream,
-                  n_hit,
-                  m_nerf.render_gbuffer_hard_edges,
-                  camera_matrix1,
-                  depth_scale,
-                  rays_hit.rgba,
-                  rays_hit.depth,
-                  rays_hit.payload,
-                  m_render_mode,
-                  m_nerf.training.linear_colors,
-                  render_buffer.frame_buffer,
-                  render_buffer.depth_buffer);
+#if 1
+    // DEBUGGING:
+    render_buffer.clear(stream);
+#endif
+
+    if (m_render_mode == ERenderMode::Slice && 0)
+    {
+        int mosaic_size = vxl::sqrt(vxl::pow2((int) vxl::ceil(vxl::sqrt((float) slice_count))));
+
+        linear_kernel(shade_kernel_nerf_draw_slices,
+                      0,
+                      stream,
+                      n_hit * slice_count,
+                      resolution,
+                      slice_count,
+                      mosaic_size,
+                      m_nerf.render_gbuffer_hard_edges,
+                      camera_matrix1,
+                      depth_scale,
+                      rays_hit.rgba,
+                      rays_hit.depth,
+                      rays_hit.payload,
+                      m_render_mode,
+                      m_nerf.training.linear_colors,
+                      render_buffer.frame_buffer,
+                      render_buffer.depth_buffer);
+    }
+    else
+    {
+        linear_kernel(shade_kernel_nerf,
+                      0,
+                      stream,
+                      n_hit,
+                      m_nerf.render_gbuffer_hard_edges,
+                      camera_matrix1,
+                      depth_scale,
+                      rays_hit.rgba,
+                      rays_hit.depth,
+                      rays_hit.payload,
+                      m_render_mode,
+                      m_nerf.training.linear_colors,
+                      render_buffer.frame_buffer,
+                      render_buffer.depth_buffer);
+    }
 
     if (render_mode == ERenderMode::Cost)
     {
@@ -2460,6 +3959,397 @@ void Testbed::render_nerf(cudaStream_t stream,
     }
 }
 
+//------------------------------------------------------------------------------
+void Testbed::render_nerf_slices(cudaStream_t stream,
+                                 CudaDevice& device,
+                                 const CudaRenderBufferView& render_buffer,
+                                 const std::shared_ptr<NerfNetwork<network_precision_t>>& nerf_network,
+                                 const uint8_t* density_grid_bitfield,
+                                 const vec2& focal_length,
+                                 const mat4x3& camera_matrix0,
+                                 const mat4x3& camera_matrix1,
+                                 const vec4& rolling_shutter,
+                                 const vec2& screen_center,
+                                 const Foveation& foveation,
+                                 int visualized_dimension)
+{
+    float aperture_size = m_aperture_size;
+
+    // HACK: flip this to negative to signify it is a slice plane!
+    if (m_render_mode == ERenderMode::Slice)
+    {
+        //plane_z = -plane_z; // force it into 2d mode where we don't advance the ray or have aperture > 0!
+
+        aperture_size = 0.f;
+    }
+
+    const float* extra_dims_gpu = m_nerf.get_rendering_extra_dims(stream);
+
+    NerfTracer tracer;
+
+    // create a 2D buffer to store the 2D distortion vectors.
+    //
+    // Our motion vector code can't undo grid distortions -- so don't render grid distortion if DLSS is enabled.
+    // (Unless we're in distortion visualization mode, in which case the distortion grid is fine to visualize.)
+    auto grid_distortion = m_nerf.render_with_lens_distortion && (!m_dlss || m_render_mode == ERenderMode::Distortion)
+                               ? m_distortion.inference_view()
+                               : Buffer2DView<const vec2>{};
+
+    Lens lens = m_nerf.render_with_lens_distortion ? m_nerf.render_lens : Lens{};
+
+    auto resolution = render_buffer.resolution;
+    int slice_count = m_slice_count;
+
+    ivec2 sliceResolution = render_buffer.resolution;
+    if (sliceResolution.x == 0)
+        return; // not yet ready!
+
+    int vx                     = m_view_tiles.x;
+    int vy                     = m_view_tiles.y;
+    int nx                     = sliceResolution.x;
+    int ny                     = sliceResolution.y;
+    float quiltViewConeFovDegX = m_quiltViewConeFovDegX;
+    float quiltViewConeFovDegY = quiltViewConeFovDegX;
+    float refForwardDist       = 0.f;
+    float alphaThreshold       = 0.001f;
+    float focalDistance        = vxl::max(0.01f, m_quiltFocusDistance);
+    float fovDegX              = focal_length_to_fov(ivec2{nx, ny}, focal_length).x;
+
+    int imageViewWidth       = nx;
+    int imageViewHeight      = ny;
+    float imageViewAspect    = (float) imageViewWidth / imageViewHeight;
+    float imageViewAspectInv = 1.f / imageViewAspect;
+
+    float referenceFovX           = vxl::radians(fovDegX);
+    float referenceCamTanHalfFovX = vxl::tan(vxl::radians(fovDegX) * 0.5f);
+    float referenceCamTanHalfFovY = referenceCamTanHalfFovX * imageViewAspectInv;
+
+    // store this original view
+    auto baseCamTanHalfFovX = referenceCamTanHalfFovX;
+    auto baseCamTanHalfFovY = baseCamTanHalfFovX * imageViewAspectInv;
+
+    // Get width & height of the focal plane...
+    float focalPlaneSizeX = baseCamTanHalfFovX * focalDistance * 2;
+    float focalPlaneSizeY = baseCamTanHalfFovY * focalDistance * 2;
+
+    // Compute viewcone camera position
+    {
+        // determine the reference fov for enlarging the view by the
+        // offset-camera's max displacement.
+        float maxOffsetX = focalDistance * vxl::tan(vxl::radians(quiltViewConeFovDegX) * 0.5f);
+        float maxOffsetY = maxOffsetX * imageViewAspectInv;
+
+        // Also calc the distance we can push forward to keep objects the same size...
+        float forwardX = focalDistance * maxOffsetX / (maxOffsetX + 0.5f * focalPlaneSizeX);
+        float forwardY = forwardX * imageViewAspectInv;
+        forwardX       = vxl::clamp(forwardX, 0.f, focalDistance);
+        forwardY       = vxl::clamp(forwardY, 0.f, focalDistance);
+
+        // calc the reference camera fov...
+        float renderCamHalfFovX = vxl::atan2(maxOffsetX, forwardX);
+
+        // overwrite the reference camera...
+        referenceFovX           = 2.0f * renderCamHalfFovX;
+        referenceCamTanHalfFovX = vxl::tan(renderCamHalfFovX);
+        referenceCamTanHalfFovY = referenceCamTanHalfFovX * imageViewAspectInv;
+    }
+
+    /*
+			auto worldToViewMat = view.getLeftViewMatrix();
+            auto modelToViewMat = worldToViewMat * modelToWorldMat;
+			
+			// get the view bounds for the slice distances calculation...
+            // NOTE: we do this before shifting the view in Z.
+            auto viewBounds = vxl::AffineTransform3f(modelToViewMat).apply(mesh.bounds_);
+            float depthNear = -viewBounds.max()[2];
+            float depthFar  = -viewBounds.min()[2];
+            depthNear       = vxl::max(view.nearDistance, depthNear);
+            depthFar        = vxl::min(view.farDistance, depthFar);
+            depthFar        = vxl::max(depthFar, depthNear);
+            //NVPV_LOGV2(depthNear, depthFar);
+			*/
+    float depthNear = m_slice_plane_z;
+    float depthFar  = depthNear + 10.f;
+    /*
+            // Get width & height of the focal plane...
+            float focalPlaneSizeX = camTanHalfFovX * focusDistance * 2;
+            float focalPlaneSizeY = camTanHalfFovY * focusDistance * 2;
+            float maxOffsetX      = focusDistance * vxl::tan(vxl::radians(viewConeFovDegX) * 0.5f);
+            float forwardX        = focusDistance * maxOffsetX / (maxOffsetX + 0.5f * focalPlaneSizeX);
+            forwardX              = vxl::clamp(forwardX, 0.f, focusDistance);
+            float camHalfFovX     = vxl::atan2(maxOffsetX, forwardX);
+            float refTanFovX      = vxl::tan(camHalfFovX);
+            float viewConeFovDegY = viewConeFovDegX * viewAspectInv;
+            float maxOffsetY      = maxOffsetX * viewAspectInv;
+            float forwardY        = forwardX * viewAspectInv;
+            forwardY              = vxl::clamp(forwardY, 0.f, focusDistance);
+            float refTanFovY      = refTanFovX * viewAspectInv;
+            float halfViewFovX    = vxl::radians(0.5f * fovDegX);
+            float halfViewFovY    = halfViewFovX * viewAspectInv;
+            float refForwardDist  = 0.f;
+			*/
+
+    int mosaicSize = vxl::sqrt(vxl::pow2((int) vxl::ceil(vxl::sqrt((float) slice_count))));
+    //float cone_angle = calc_cone_angle(dot(dir, camera_fwd), focal_length, cone_angle_constant);
+
+    vec2 ref_focal_length =
+        fov_to_focal_length(ivec2{nx, ny}, {vxl::degrees(referenceFovX), vxl::degrees(referenceFovX)});
+
+    // create the camera rays...
+    tracer.init_rays_from_camera(
+        render_buffer.spp,
+        nerf_network->padded_output_width(),
+        nerf_network->n_extra_dims(),
+        sliceResolution,
+        slice_count,
+        ref_focal_length,
+        camera_matrix0,
+        camera_matrix1,
+        rolling_shutter,
+        screen_center,
+        m_parallax_shift,
+        m_snap_to_pixel_centers,
+        m_render_aabb,
+        m_render_aabb_to_local,
+        m_render_near_distance,
+        depthNear,
+        aperture_size,
+        foveation,
+        lens,
+        m_envmap.inference_view(),
+        grid_distortion,
+        render_buffer.frame_buffer,
+        render_buffer.depth_buffer,
+        render_buffer.hidden_area_mask ? render_buffer.hidden_area_mask->const_view() : Buffer2DView<const uint8_t>{},
+        density_grid_bitfield,
+        m_nerf.show_accel,
+        m_nerf.max_cascade,
+        m_nerf.cone_angle_constant,
+        ERenderMode::Slice,
+        stream);
+
+    float depth_scale = 1.0f / m_nerf.training.dataset.scale;
+
+    uint32_t n_hit = tracer.traceSlices(nerf_network,
+                                        m_render_aabb,
+                                        m_render_aabb_to_local,
+                                        m_aabb,
+                                        sliceResolution,
+                                        slice_count,
+                                        ref_focal_length,
+                                        m_nerf.cone_angle_constant,
+                                        density_grid_bitfield,
+                                        camera_matrix1,
+                                        depth_scale,
+                                        m_nerf.rgb_activation,
+                                        m_nerf.density_activation,
+                                        depthNear,
+                                        m_nerf.max_cascade,
+                                        m_nerf.render_min_transmittance,
+                                        extra_dims_gpu,
+                                        stream);
+
+    RaysNerfSoa& rays_hit = tracer.rays_hit();
+
+    if (n_hit == 0)
+        return;
+#if 1
+    uint32_t n_elements             = next_multiple(n_hit, BATCH_SIZE_GRANULARITY);
+    const uint32_t floats_per_coord = sizeof(NerfCoordinate) / sizeof(float) + nerf_network->n_extra_dims();
+    const uint32_t extra_stride =
+        nerf_network->n_extra_dims() * sizeof(float); // extra stride on top of base NerfCoordinate struct
+
+    GPUMatrix<float> positions_matrix{floats_per_coord, n_elements, stream};
+    GPUMatrix<float> rgbsigma_matrix{4, n_elements, stream};
+
+    uint32_t n_steps_between_compaction = 1;
+    PitchedPtr<NerfCoordinate> input_data;
+
+#else
+    // Want a large number of queries to saturate the GPU and to ensure compaction doesn't happen toooo frequently.
+    uint32_t target_n_queries           = 2 * 1024 * 1024;
+    uint32_t n_steps_between_compaction = 4; /*clamp(target_n_queries / n_hit,
+                                                        (uint32_t) MIN_STEPS_INBETWEEN_COMPACTION,
+                                                        (uint32_t) MAX_STEPS_INBETWEEN_COMPACTION);*/
+
+    uint32_t extra_stride = nerf_network->n_extra_dims() * sizeof(float);
+    PitchedPtr<NerfCoordinate> input_data((NerfCoordinate*) tracer.m_network_input, 1, 0, extra_stride);
+
+    uint32_t n_elements = next_multiple(n_hit * n_steps_between_compaction, BATCH_SIZE_GRANULARITY);
+    GPUMatrix<float> positions_matrix(
+        (float*) tracer.m_network_input, (sizeof(NerfCoordinate) + extra_stride) / sizeof(float), n_elements);
+    GPUMatrix<network_precision_t, RM> rgbsigma_matrix(
+        (network_precision_t*) tracer.m_network_output, nerf_network->padded_output_width(), n_elements);
+
+#endif
+
+    // make slice buffer large enough for a batch of slices...
+    static auto sliceColorBuf = std::make_shared<Buffer2D<vec4>>();
+    sliceColorBuf->resize(ivec2{sliceResolution.x, sliceResolution.y * (int) 1});
+    vec4* sliceColorPtr = sliceColorBuf->data();
+
+    // CAVEAT: do we need to clear?
+    render_buffer.clear(stream);
+
+    // track the depth in world units...
+    float sliceBatchDistance = depthNear;
+
+    for (int slice_i = 0; slice_i < slice_count; slice_i += 1)
+    {
+#if 1
+        linear_kernel(generate_nerf_network_inputs_at_current_position,
+                      0,
+                      stream,
+                      n_hit,
+                      m_aabb,
+                      rays_hit.payload,
+                      PitchedPtr<NerfCoordinate>((NerfCoordinate*) positions_matrix.data(), 1, 0, extra_stride),
+                      extra_dims_gpu);
+
+        nerf_network->inference(stream, positions_matrix, rgbsigma_matrix);
+
+        linear_kernel(compute_nerf_rgba_kernel,
+                      0,
+                      stream,
+                      n_hit,
+                      (vec4*) rgbsigma_matrix.data(),
+                      m_nerf.rgb_activation,
+                      m_nerf.density_activation,
+                      from_stepping_space(m_delta_z, 0.0f),
+                      false);
+#else
+        linear_kernel(generate_next_nerf_network_inputs_slices,
+                      0,
+                      stream,
+                      n_hit,
+                      m_render_aabb,
+                      m_render_aabb_to_local,
+                      m_aabb,
+                      render_buffer.spp,
+                      focal_length,
+                      camera_matrix1[2],
+                      rays_hit.payload,
+                      input_data,
+                      n_steps_between_compaction,
+                      density_grid_bitfield,
+                      (m_nerf.show_accel >= 0) ? m_nerf.show_accel : 0,
+                      m_nerf.max_cascade,
+                      m_nerf.cone_angle_constant,
+                      extra_dims_gpu);
+
+        nerf_network->inference_mixed_precision(stream, positions_matrix, rgbsigma_matrix);
+#endif
+
+#if 1
+        // draw all the slices in a mosaic!
+
+        linear_kernel(shade_kernel_nerf_slice,
+                      0,
+                      stream,
+                      n_hit,
+                      n_elements,
+                      resolution,
+                      slice_i,
+                      mosaicSize,
+                      m_nerf.render_gbuffer_hard_edges,
+                      camera_matrix1,
+                      depth_scale,
+                      (vec4*) rgbsigma_matrix.data(),
+                      nullptr,
+                      rays_hit.payload,
+                      m_render_mode,
+
+					  m_aabb,
+                      input_data,
+                      tracer.m_network_output,
+                      nerf_network->padded_output_width(),
+                      m_nerf.rgb_activation,
+                      m_nerf.density_activation,
+                      n_steps_between_compaction,
+
+                      m_nerf.training.linear_colors,
+                      render_buffer.frame_buffer,
+                      render_buffer.depth_buffer);
+#else
+        // composite into slice into accumulated buffer!
+        // for a test, just use the same framebuffer!
+        // we can treat the framebuffer's alpha as 1-transmission.
+
+        linear_kernel(shade_kernel_nerf_accumulate_slice,
+                      0,
+                      stream,
+                      n_hit,
+                      n_elements,
+                      sliceResolution,
+                      m_aabb,
+                      slice_i,
+                      depth_scale,
+                      rays_hit.payload,
+                      (vec4*) rgbsigma_matrix.data(),
+                      nullptr,
+
+                      input_data,
+                      tracer.m_network_output,
+                      nerf_network->padded_output_width(),
+                      m_nerf.rgb_activation,
+                      m_nerf.density_activation,
+                      n_steps_between_compaction,
+
+                      m_nerf.training.linear_colors,
+                      sliceColorPtr,
+                      render_buffer.depth_buffer);
+
+        linear_kernel(kernel_slice_blend,
+                      0,
+                      stream,
+                      resolution.x * resolution.y,
+                      resolution,
+                      vx,
+                      vy,
+                      render_buffer.frame_buffer,
+                      render_buffer.depth_buffer,
+                      alphaThreshold,
+                      focalDistance,
+                      0.5f * vxl::radians(quiltViewConeFovDegX),
+                      0.5f * vxl::radians(quiltViewConeFovDegY),
+                      referenceCamTanHalfFovX,
+                      referenceCamTanHalfFovY,
+                      baseCamTanHalfFovX,
+                      baseCamTanHalfFovY,
+                      refForwardDist,
+                      sliceBatchDistance,
+                      sliceResolution,
+                      1, //n_steps_between_compaction,
+                      slice_count,
+                      sliceColorPtr);
+
+#endif
+
+        // now step forward the slice distance.
+        // we use some randomness for the distance to get a smooth blend between slices...
+        linear_kernel(step_pos_nerf_kernel,
+                      0,
+                      stream,
+                      n_hit,
+                      m_render_aabb,
+                      m_render_aabb_to_local,
+                      camera_matrix1[2],
+                      focal_length,
+                      render_buffer.spp,
+                      rays_hit.payload,
+                      density_grid_bitfield,
+                      (m_nerf.show_accel >= 0) ? m_nerf.show_accel : 0,
+                      m_nerf.max_cascade,
+                      m_nerf.cone_angle_constant,
+                      m_delta_z * 1);
+
+        sliceBatchDistance += from_stepping_space(1 * m_delta_z, 0.f);
+    }
+
+    return;
+}
+
+//------------------------------------------------------------------------------
 void Testbed::Nerf::Training::set_camera_intrinsics(int frame_idx,
                                                     float fx,
                                                     float fy,

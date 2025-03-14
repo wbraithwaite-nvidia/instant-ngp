@@ -170,5 +170,6 @@ struct NerfDataset {
 
 NerfDataset load_nerf(const std::vector<fs::path>& jsonpaths, float sharpen_amount = 0.f);
 NerfDataset create_empty_nerf_dataset(size_t n_images, int aabb_scale = 1, bool is_hdr = false);
+NerfDataset& resize_nerf_dataset(NerfDataset& result, size_t n_images, int aabb_scale = 1, bool is_hdr = false);
 
 }
