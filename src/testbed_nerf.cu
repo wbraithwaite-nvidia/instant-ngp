@@ -37,21 +37,118 @@
 #include <filesystem/directory.h>
 #include <filesystem/path.h>
 
-#if NVPV_USE_OPENVXL
-#include <openvxl/compute/cuda.h>
-#include <openvxl/platform/cuda/cuda.h>
-#include <openvxl/math/AffineTransform.h> // for AffineTransform
-#include <openvxl/math/Color.h>           // for colorFromPackedRGBA
-
-namespace vxl {
-using namespace openvxl;
-using namespace openvxl::math;
-} // namespace vxl
+#if !defined(OPENVXL_USE_CUDA)
+#error OPENVXL_USE_CUDA required!
 #endif
 
 #ifdef copysign
 #undef copysign
 #endif
+
+namespace vxl_ext {
+
+//----------------------------------------------------------------------------------------------
+OPENVXL_CUDA_INLINE vxl::Vec3f32 getRayPos(const vxl::Mat4f32& viewToWorldMat)
+{
+    return vxl::Vec3f32(viewToWorldMat.getColumn(3));
+}
+
+//----------------------------------------------------------------------------------------------
+OPENVXL_CUDA_INLINE vxl::Vec3f32 getRayDir(float u,
+                                           float v,
+                                           const vxl::Mat4f32& clipToViewMat,
+                                           const vxl::Mat4f32& viewToWorldMat)
+{
+    auto clipPos = vxl::Vec4f32(2.f * u - 1.f, 2.f * v - 1.f, -1.f, 0.f);
+    auto dirEye  = vxl::Vec3f32(clipToViewMat * clipPos);
+    dirEye[2]    = -1.f;
+    //auto dirWorld = transpose(inverse(viewToWorldMat)) * dirEye;
+    auto dirWorld = viewToWorldMat.getRotationMatrix() * dirEye;
+    return dirWorld.normalize();
+}
+
+//----------------------------------------------------------------------------------------------
+// map quilt-tile index to offset angle.
+OPENVXL_CUDA_INLINE vxl::Vec2f32
+    getPlaneOffset(int vi, int vj, int vx, int vy, float halfViewFovX, float halfViewFovY, float focalDistance)
+{
+#if 1
+    // the looking glass quilt format...
+    // 6 7 8
+    // 3 4 5
+    // 0 1 2
+    // where value is xoffset starting from left-most.
+    int n = (vx * vy - 1);
+    if (n == 0)
+        return {0, 0};
+    int v_offset    = vi + vj * vx;
+    float tileU     = float(v_offset) / n;
+    float offAngleX = tileU * (2.0f * halfViewFovX) - halfViewFovX;
+    return {vxl::tan(offAngleX) * focalDistance, 0.f};
+#else
+
+    // just a patch work... but not the format!
+    vxl::swap(vx, vy);
+
+    float offAngleY = 0.f;
+    float offAngleX = 0.f;
+    if (vx > 1)
+    {
+        float tileU = (float) vi / (vx - 1);
+        offAngleX   = tileU * (2.0f * halfViewFovX) - halfViewFovX;
+    }
+    if (vy > 1)
+    {
+        float tileV = (float) vj / (vy - 1);
+        offAngleY   = tileV * (2.0f * halfViewFovY) - halfViewFovY;
+    }
+    // get the 2d offset on the focal plane from the view ray...
+    float offsetX = vxl::tan(offAngleX) * focalDistance;
+    float offsetY = vxl::tan(offAngleY) * focalDistance;
+    return {offsetX, offsetY};
+#endif
+
+    return {0, 0};
+}
+
+//-------------------------------------------------------------------------------------------
+
+//-------------------------------------------------------------------------------------------
+OPENVXL_CUDA_INLINE void getRay(vxl::Vec3f32& ro,
+                                vxl::Vec3f32& rd,
+                                int vi,
+                                int vj,
+                                float tileU,
+                                float tileV,
+                                const ngp::MosaicViewData& renderViewData)
+{
+    // account for view separation...
+    vxl::Vec2f32 viewOffset = getPlaneOffset(vi,
+                                             vj,
+                                             renderViewData.mosaicTileCount[0],
+                                             renderViewData.mosaicTileCount[1],
+                                             renderViewData.viewConeHalfFovX,
+                                             renderViewData.viewConeHalfFovX,
+                                             renderViewData.focalDistance);
+
+    float mx = (tileU * 2 - 1) / renderViewData.renderAspect;
+    mx -= (viewOffset[0] / (renderViewData.viewCamTanHalfFovX * renderViewData.focalDistance)) /
+          renderViewData.renderAspect;
+
+    ro = getRayPos(renderViewData.viewToWorldMat);
+    // offset in the plane. OPT: make this faster!
+    ro += renderViewData.viewToWorldMat.getRotationMatrix() * vxl::Vec3f32(viewOffset[0], viewOffset[1], 0.0f);
+
+    // get the uv coord in the plane for this ray.
+    // Note it is offseted by view-separation and squished for preserving aspect.
+    // we also use imageViewAspectInv to squish the ray dir vertically.
+    vxl::Vec2f32 rayPlaneOffset = {mx * 0.5f + 0.5f,
+                                   ((tileV * 2 - 1) * renderViewData.imageViewAspectInv) * 0.5f + 0.5f};
+
+    rd = getRayDir(rayPlaneOffset[0], rayPlaneOffset[1], renderViewData.clipToViewMat, renderViewData.viewToWorldMat);
+}
+
+} // namespace vxl_ext
 
 namespace ngp {
 
@@ -2729,6 +2826,7 @@ __global__ void debug_rays_kernel(const uint32_t n_elements,
     }
 }
 
+//-------------------------------------------------------------------------------------------
 // for every pixel in the output image, build the ray.
 // we also setup the depthbuffer.
 __global__ void init_rays_with_payload_kernel_nerf(uint32_t sample_index,
@@ -2753,7 +2851,9 @@ __global__ void init_rays_with_payload_kernel_nerf(uint32_t sample_index,
                                                    float* __restrict__ depth_buffer,
                                                    Buffer2DView<const uint8_t> hidden_area_mask,
                                                    Buffer2DView<const vec2> distortion,
-                                                   ERenderMode render_mode)
+                                                   ERenderMode render_mode,
+                                                   MosaicData mosaic,
+                                                   MosaicViewData renderViewData)
 {
     uint32_t x = threadIdx.x + blockDim.x * blockIdx.x;
     uint32_t y = threadIdx.y + blockDim.y * blockIdx.y;
@@ -2777,6 +2877,41 @@ __global__ void init_rays_with_payload_kernel_nerf(uint32_t sample_index,
     mat4x3 camera = get_xform_given_rolling_shutter(
         {camera_matrix0, camera_matrix1}, rolling_shutter, uv, ld_random_val(sample_index, idx * 72239731));
 
+#if 1
+    // compute quilt mosaic position...
+    int ix             = x;
+    int iy             = (resolution.y - y) - 1;
+    float viewportU    = (float) (ix * renderViewData.mosaicTileCount[0]) / resolution.x;
+    float viewportV    = (float) (iy * renderViewData.mosaicTileCount[1]) / resolution.y;
+    auto viewportIndex = vxl::Vec2s32(vxl::floor(viewportU), vxl::floor(viewportV));
+    viewportU -= viewportIndex[0];
+    viewportV -= viewportIndex[1];
+
+    // add jitter
+    viewportU += pixel_offset.x / resolution.x;
+    viewportV += pixel_offset.y / resolution.y;
+
+    vxl::Vec3f32 ro, rd;
+    vxl_ext::getRay(ro, rd, viewportIndex[0], viewportIndex[1], viewportU, viewportV, renderViewData);
+
+    Ray ray;
+    ray.o = vec3{ro[0], ro[1], ro[2]};
+    ray.d = vec3{rd[0], rd[1], rd[2]};
+
+    ray.o += ray.d * near_distance;
+
+    if (false)
+    {
+        NerfPayload& payload    = payloads[idx];
+        frame_buffer[idx].rgb() = vec3(viewportU, viewportV, 0);
+        frame_buffer[idx].a     = 1.0f;
+        depth_buffer[idx]       = 1.0f;
+        payload.origin          = ray(MAX_DEPTH());
+        payload.alive           = false;
+        return;
+    }
+
+#else
     // get the ray for the uv position...
     Ray ray = uv_to_ray(sample_index,
                         uv,
@@ -2792,6 +2927,8 @@ __global__ void init_rays_with_payload_kernel_nerf(uint32_t sample_index,
                         hidden_area_mask,
                         lens,
                         distortion);
+
+#endif
 
     // initialize the payload...
     NerfPayload& payload = payloads[idx];
@@ -2823,7 +2960,7 @@ __global__ void init_rays_with_payload_kernel_nerf(uint32_t sample_index,
         return;
     }
 
-#if 1
+#if 0
     if (render_mode == ERenderMode::Distortion)
     {
         // draw the distortion as color...
@@ -2949,7 +3086,6 @@ void Testbed::NerfTracer::init_rays_from_camera(uint32_t sample_index,
                                                 uint32_t padded_output_width,
                                                 uint32_t n_extra_dims,
                                                 const ivec2& resolution,
-                                                int slice_count,
                                                 const vec2& focal_length,
                                                 const mat4x3& camera_matrix0,
                                                 const mat4x3& camera_matrix1,
@@ -3008,7 +3144,112 @@ void Testbed::NerfTracer::init_rays_from_camera(uint32_t sample_index,
                                                                        depth_buffer,
                                                                        hidden_area_mask,
                                                                        distortion,
-                                                                       render_mode);
+                                                                       render_mode,
+                                                                       MosaicData{},
+                                                                       MosaicViewData{});
+
+    m_n_rays_initialized = resolution.x * resolution.y;
+
+    // CAVEAT: clear the original color+depth of the first (double-buffered) ray framebuffer.
+    CUDA_CHECK_THROW(cudaMemsetAsync(m_rays[0].rgba, 0, m_n_rays_initialized * sizeof(vec4), stream));
+    CUDA_CHECK_THROW(cudaMemsetAsync(m_rays[0].depth, 0, m_n_rays_initialized * sizeof(float), stream));
+
+    if (plane_z < 0)
+    {
+        // HACK: when in original slice rendermode, we negate the plane_z.
+        // we are rendering in original 2d slice mode. so do not bother to trace forward in the volume.
+        // we already terminated the rays.
+    }
+    else
+    {
+        // find a suitable first position in the volume...
+        // when this function is over, the ray will either have terminated, or it will
+        // at the first occupied voxel based on the density grid.
+        linear_kernel(advance_pos_nerf_kernel,
+                      0,
+                      stream,
+                      m_n_rays_initialized,
+                      render_aabb,
+                      render_aabb_to_local,
+                      camera_matrix1[2],
+                      focal_length,
+                      sample_index,
+                      m_rays[0].payload,
+                      grid,
+                      (show_accel >= 0) ? show_accel : 0,
+                      max_mip,
+                      cone_angle_constant);
+    }
+}
+
+//----------------------------------------------------------------------------------------------
+void Testbed::NerfTracer::init_rays_from_camera_mosaic(const MosaicData& mosaic,
+                                                       const MosaicViewData& mosaicViewData,
+                                                       uint32_t sample_index,
+                                                       uint32_t padded_output_width,
+                                                       uint32_t n_extra_dims,
+                                                       const ivec2& resolution,
+                                                       const vec2& focal_length,
+                                                       const mat4x3& camera_matrix0,
+                                                       const mat4x3& camera_matrix1,
+                                                       const vec4& rolling_shutter,
+                                                       const vec2& screen_center,
+                                                       const vec3& parallax_shift,
+                                                       bool snap_to_pixel_centers,
+                                                       const BoundingBox& render_aabb,
+                                                       const mat3& render_aabb_to_local,
+                                                       float near_distance,
+                                                       float plane_z,
+                                                       float aperture_size,
+                                                       const Foveation& foveation,
+                                                       const Lens& lens,
+                                                       const Buffer2DView<const vec4>& envmap,
+                                                       const Buffer2DView<const vec2>& distortion,
+                                                       vec4* frame_buffer,
+                                                       float* depth_buffer,
+                                                       const Buffer2DView<const uint8_t>& hidden_area_mask,
+                                                       const uint8_t* grid,
+                                                       int show_accel,
+                                                       uint32_t max_mip,
+                                                       float cone_angle_constant,
+                                                       ERenderMode render_mode,
+                                                       cudaStream_t stream)
+{
+    // Make sure we have enough memory reserved to render at the requested resolution
+    size_t n_pixels = (size_t) resolution.x * resolution.y;
+
+    // ensure we have memory for our ray data (the payload)...
+    enlarge(n_pixels, padded_output_width, n_extra_dims, 1, stream);
+
+    // build the rays...
+    const dim3 threads = {16, 8, 1};
+    const dim3 blocks  = {
+        div_round_up((uint32_t) resolution.x, threads.x), div_round_up((uint32_t) resolution.y, threads.y), 1};
+    init_rays_with_payload_kernel_nerf<<<blocks, threads, 0, stream>>>(sample_index,
+                                                                       m_rays[0].payload,
+                                                                       resolution,
+                                                                       focal_length,
+                                                                       camera_matrix0,
+                                                                       camera_matrix1,
+                                                                       rolling_shutter,
+                                                                       screen_center,
+                                                                       parallax_shift,
+                                                                       snap_to_pixel_centers,
+                                                                       render_aabb,
+                                                                       render_aabb_to_local,
+                                                                       near_distance,
+                                                                       plane_z,
+                                                                       aperture_size,
+                                                                       foveation,
+                                                                       lens,
+                                                                       envmap,
+                                                                       frame_buffer,
+                                                                       depth_buffer,
+                                                                       hidden_area_mask,
+                                                                       distortion,
+                                                                       render_mode,
+                                                                       mosaic,
+                                                                       mosaicViewData);
 
     m_n_rays_initialized = resolution.x * resolution.y;
 
@@ -3595,7 +3836,6 @@ void Testbed::render_nerf(cudaStream_t stream,
     Lens lens = m_nerf.render_with_lens_distortion ? m_nerf.render_lens : Lens{};
 
     auto resolution = render_buffer.resolution;
-    int slice_count = 32; //std::min(4, RaysNerfSoa::ColorType::kSize);
 
 #if 0
     if (false && render_mode == ERenderMode::Slice)
@@ -3769,12 +4009,13 @@ void Testbed::render_nerf(cudaStream_t stream,
 #endif
 
     // create the camera rays...
-    tracer.init_rays_from_camera(
+    tracer.init_rays_from_camera_mosaic(
+        m_mosaic,
+        m_mosaicViewData,
         render_buffer.spp,
         nerf_network->padded_output_width(),
         nerf_network->n_extra_dims(),
         render_buffer.resolution,
-        slice_count,
         focal_length,
         camera_matrix0,
         camera_matrix1,
@@ -3818,7 +4059,7 @@ void Testbed::render_nerf(cudaStream_t stream,
                              m_render_aabb_to_local,
                              m_aabb,
                              resolution,
-                             slice_count,
+                             m_mosaic.m_slice_count,
                              focal_length,
                              m_nerf.cone_angle_constant,
                              density_grid_bitfield,
@@ -3904,14 +4145,14 @@ void Testbed::render_nerf(cudaStream_t stream,
 
     if (m_render_mode == ERenderMode::Slice && 0)
     {
-        int mosaic_size = vxl::sqrt(vxl::pow2((int) vxl::ceil(vxl::sqrt((float) slice_count))));
+        int mosaic_size = vxl::sqrt(vxl::pow2((int) vxl::ceil(vxl::sqrt((float) m_mosaic.m_slice_count))));
 
         linear_kernel(shade_kernel_nerf_draw_slices,
                       0,
                       stream,
-                      n_hit * slice_count,
+                      n_hit * m_mosaic.m_slice_count,
                       resolution,
-                      slice_count,
+                      m_mosaic.m_slice_count,
                       mosaic_size,
                       m_nerf.render_gbuffer_hard_edges,
                       camera_matrix1,
@@ -3973,6 +4214,23 @@ void Testbed::render_nerf_slices(cudaStream_t stream,
                                  const Foveation& foveation,
                                  int visualized_dimension)
 {
+    if (m_render_mode != ERenderMode::Slice)
+    {
+        render_nerf(stream,
+                    device,
+                    render_buffer,
+                    nerf_network,
+                    density_grid_bitfield,
+                    focal_length,
+                    camera_matrix0,
+                    camera_matrix1,
+                    rolling_shutter,
+                    screen_center,
+                    foveation,
+                    visualized_dimension);
+        return;
+    }
+
     float aperture_size = m_aperture_size;
 
     // HACK: flip this to negative to signify it is a slice plane!
@@ -3998,21 +4256,21 @@ void Testbed::render_nerf_slices(cudaStream_t stream,
     Lens lens = m_nerf.render_with_lens_distortion ? m_nerf.render_lens : Lens{};
 
     auto resolution = render_buffer.resolution;
-    int slice_count = m_slice_count;
+    int slice_count = m_mosaic.m_slice_count;
 
     ivec2 sliceResolution = render_buffer.resolution;
     if (sliceResolution.x == 0)
         return; // not yet ready!
 
-    int vx                     = m_view_tiles.x;
-    int vy                     = m_view_tiles.y;
+    int vx                     = m_mosaic.m_view_tiles.x;
+    int vy                     = m_mosaic.m_view_tiles.y;
     int nx                     = sliceResolution.x;
     int ny                     = sliceResolution.y;
-    float quiltViewConeFovDegX = m_quiltViewConeFovDegX;
+    float quiltViewConeFovDegX = m_mosaic.m_quiltViewConeFovDegX;
     float quiltViewConeFovDegY = quiltViewConeFovDegX;
     float refForwardDist       = 0.f;
     float alphaThreshold       = 0.001f;
-    float focalDistance        = vxl::max(0.01f, m_quiltFocusDistance);
+    float focalDistance        = vxl::max(0.01f, m_mosaic.m_quiltFocusDistance);
     float fovDegX              = focal_length_to_fov(ivec2{nx, ny}, focal_length).x;
 
     int imageViewWidth       = nx;
@@ -4101,7 +4359,6 @@ void Testbed::render_nerf_slices(cudaStream_t stream,
         nerf_network->padded_output_width(),
         nerf_network->n_extra_dims(),
         sliceResolution,
-        slice_count,
         ref_focal_length,
         camera_matrix0,
         camera_matrix1,
@@ -4215,7 +4472,7 @@ void Testbed::render_nerf_slices(cudaStream_t stream,
                       (vec4*) rgbsigma_matrix.data(),
                       m_nerf.rgb_activation,
                       m_nerf.density_activation,
-                      from_stepping_space(m_delta_z, 0.0f),
+                      from_stepping_space(m_mosaic.m_delta_z, 0.0f),
                       false);
 #else
         linear_kernel(generate_next_nerf_network_inputs_slices,
@@ -4259,7 +4516,7 @@ void Testbed::render_nerf_slices(cudaStream_t stream,
                       rays_hit.payload,
                       m_render_mode,
 
-					  m_aabb,
+                      m_aabb,
                       input_data,
                       tracer.m_network_output,
                       nerf_network->padded_output_width(),
@@ -4341,9 +4598,9 @@ void Testbed::render_nerf_slices(cudaStream_t stream,
                       (m_nerf.show_accel >= 0) ? m_nerf.show_accel : 0,
                       m_nerf.max_cascade,
                       m_nerf.cone_angle_constant,
-                      m_delta_z * 1);
+                      m_mosaic.m_delta_z * 1);
 
-        sliceBatchDistance += from_stepping_space(1 * m_delta_z, 0.f);
+        sliceBatchDistance += from_stepping_space(1 * m_mosaic.m_delta_z, 0.f);
     }
 
     return;

@@ -3842,6 +3842,185 @@ void Testbed::train_and_render(bool skip_rendering)
     CUDA_CHECK_THROW(cudaStreamSynchronize(m_stream.get()));
 }
 
+//-----------------------------------------------------------------------------------------
+void Testbed::simple_render()
+{
+    auto smoothed_camera_backup = m_smoothed_camera;
+
+    // Don't do any smoothing here if a camera path is being rendered. It'll take care
+    // of the smoothing on its own.
+    float frame_ms = m_camera_path.rendering ? 0.0f : m_frame_ms.val();
+    apply_camera_smoothing(frame_ms);
+
+    auto start = std::chrono::steady_clock::now();
+    ScopeGuard timing_guard{[&]() {
+        m_render_ms.update(std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - start).count());
+    }};
+
+    if (frobenius_norm(m_smoothed_camera - m_camera) < 0.001f)
+    {
+        m_smoothed_camera = m_camera;
+    }
+    else
+    {
+        reset_accumulation(true);
+    }
+
+    if (frobenius_norm(smoothed_camera_backup - m_smoothed_camera) > 0.001f)
+        reset_accumulation(true);
+
+    if (m_single_view)
+    {
+        set_n_views(1);
+        m_n_views = {1, 1};
+
+        auto& view = m_views.front();
+
+        //view.full_resolution = m_window_res;
+
+        view.camera0 = m_smoothed_camera;
+        view.camera1 = view.camera0;
+
+        view.visualized_dimension  = m_visualized_dimension;
+        view.relative_focal_length = m_relative_focal_length;
+        view.screen_center         = m_screen_center;
+        view.render_buffer->set_hidden_area_mask(nullptr);
+        view.foveation = {};
+        view.device    = &primary_device();
+    }
+
+    // Update dynamic res
+    {
+        size_t n_pixels = 0, n_pixels_full_res = 0;
+        for (const auto& view : m_views)
+        {
+            n_pixels += product(view.render_buffer->in_resolution());
+            n_pixels_full_res += product(view.full_resolution);
+        }
+
+        float pixel_ratio = (n_pixels == 0) ? (1.0f / 256.0f) : ((float) n_pixels / (float) n_pixels_full_res);
+
+        float last_factor = std::sqrt(pixel_ratio);
+        float factor      = std::sqrt(pixel_ratio / m_render_ms.val() * 1000.0f / m_dynamic_res_target_fps);
+        if (!m_dynamic_res)
+        {
+            factor = 8.f / (float) m_fixed_res_factor;
+        }
+
+        factor = clamp(factor, 1.0f / 16.0f, 1.0f);
+
+        for (auto&& view : m_views)
+        {
+            ivec2 render_res = view.render_buffer->in_resolution();
+            if (render_res[0] == 0 || render_res[1] == 0)
+                continue;
+            //assert(render_res[0] != 0 && render_res[1] != 0);
+
+            ivec2 new_render_res =
+                clamp(ivec2(vec2(view.full_resolution) * factor), view.full_resolution / 16, view.full_resolution);
+
+            float ratio = std::sqrt((float) product(render_res) / (float) product(new_render_res));
+            if (ratio > 1.2f || ratio < 0.8f || factor == 1.0f || !m_dynamic_res)
+            {
+                render_res = new_render_res;
+            }
+
+            view.render_buffer->resize(render_res);
+
+            view.foveation = {};
+        }
+    }
+
+    // Make sure all in-use auxiliary GPUs have the latest model and bitfield
+    std::unordered_set<CudaDevice*> devices_in_use;
+    for (auto& view : m_views)
+    {
+        if (!view.device || devices_in_use.count(view.device) != 0)
+        {
+            continue;
+        }
+
+        devices_in_use.insert(view.device);
+        sync_device(*view.render_buffer, *view.device);
+    }
+
+    {
+        SyncedMultiStream synced_streams{m_stream.get(), m_views.size()};
+
+        std::vector<std::future<void>> futures(m_views.size());
+        for (size_t i = 0; i < m_views.size(); ++i)
+        {
+            auto& view = m_views[i];
+            futures[i] = view.device->enqueue_task([this, &view, stream = synced_streams.get(i)]() {
+                auto device_guard = use_device(stream, *view.render_buffer, *view.device);
+                render_frame_main(*view.device,
+                                  view.camera0,
+                                  view.camera1,
+                                  view.screen_center,
+                                  view.relative_focal_length,
+                                  {0.0f, 0.0f, 0.0f, 1.0f},
+                                  view.foveation,
+                                  view.visualized_dimension);
+            });
+        }
+
+        for (size_t i = 0; i < m_views.size(); ++i)
+        {
+            auto& view = m_views[i];
+
+            if (futures[i].valid())
+            {
+                futures[i].get();
+            }
+
+            {
+                const bool to_srgb                = false;
+                cudaStream_t stream               = synced_streams.get(i);
+                const mat4x3& camera_matrix0      = view.camera0;
+                const mat4x3& prev_camera_matrix  = view.prev_camera;
+                const vec2& orig_screen_center    = view.screen_center;
+                const vec2& relative_focal_length = view.relative_focal_length;
+                const Foveation& foveation        = view.foveation;
+                const Foveation& prev_foveation   = view.prev_foveation;
+                CudaRenderBuffer& render_buffer   = *view.render_buffer;
+
+                vec2 focal_length =
+                    calc_focal_length(render_buffer.in_resolution(), relative_focal_length, m_fov_axis, m_zoom);
+                vec2 screen_center = render_screen_center(orig_screen_center);
+
+                render_buffer.set_color_space(m_color_space);
+                render_buffer.set_tonemap_curve(m_tonemap_curve);
+
+                Lens lens = (m_nerf.render_with_lens_distortion) ? m_nerf.render_lens : Lens{};
+
+                EColorSpace output_color_space = to_srgb ? EColorSpace::SRGB : EColorSpace::Linear;
+
+                render_buffer.accumulate(m_exposure, stream);
+
+                render_buffer.tonemap(m_exposure,
+                                      m_background_color,
+                                      output_color_space,
+                                      m_ndc_znear,
+                                      m_ndc_zfar,
+                                      m_snap_to_pixel_centers,
+                                      stream);
+            }
+
+            view.prev_camera    = view.camera0;
+            view.prev_foveation = view.foveation;
+        }
+    }
+
+    for (size_t i = 0; i < m_views.size(); ++i)
+    {
+        // NOTE: these might be NOPs if SurfaceProviders we are CUDA already or they are interoped.
+        m_rgba_render_textures.at(i)->blit_to_surface();
+        m_depth_render_textures.at(i)->blit_to_surface();
+    }
+
+    CUDA_CHECK_THROW(cudaStreamSynchronize(m_stream.get()));
+}
+
 #ifdef NGP_GUI
 void Testbed::create_second_window()
 {
@@ -5435,17 +5614,17 @@ void Testbed::render_frame_main(CudaDevice& device,
         if (!m_render_ground_truth || m_ground_truth_alpha < 1.0f)
         {
             render_nerf_slices(device.stream(),
-                        device,
-                        device.render_buffer_view(),
-                        device.nerf_network(),
-                        device.data().density_grid_bitfield_ptr,
-                        focal_length,
-                        camera_matrix0,
-                        camera_matrix1,
-                        nerf_rolling_shutter,
-                        screen_center,
-                        foveation,
-                        visualized_dimension);
+                               device,
+                               device.render_buffer_view(),
+                               device.nerf_network(),
+                               device.data().density_grid_bitfield_ptr,
+                               focal_length,
+                               camera_matrix0,
+                               camera_matrix1,
+                               nerf_rolling_shutter,
+                               screen_center,
+                               foveation,
+                               visualized_dimension);
         }
         break;
     case ETestbedMode::Sdf: {

@@ -45,6 +45,19 @@
 
 #include <cuda.h>
 
+
+#if NVPV_USE_OPENVXL
+#include <openvxl/compute/cuda.h>
+#include <openvxl/platform/cuda/cuda.h>
+#include <openvxl/math/AffineTransform.h> // for AffineTransform
+#include <openvxl/math/Color.h>           // for colorFromPackedRGBA
+
+namespace vxl {
+using namespace openvxl;
+using namespace openvxl::math;
+} // namespace vxl
+#endif
+
 struct GLFWwindow;
 
 namespace tcnn {
@@ -63,6 +76,33 @@ class TrainableBuffer;
 } // namespace tcnn
 
 namespace ngp {
+
+struct MosaicData
+{
+    float m_delta_z              = 1;
+    int m_slice_count            = 1;
+    float m_quiltFocusDistance   = 1;
+    float m_quiltViewConeFovDegX = 45.f;
+    ivec2 m_view_tiles           = ivec2{1, 1};
+};
+
+struct MosaicViewData
+{
+    float focalDistance;
+    float viewCamTanHalfFovX;
+    float viewConeHalfFovX;
+    float imageViewAspectInv;
+    vxl::Vec2s32 mosaicTileSize;
+    vxl::Vec2s32 mosaicTileCount;
+    vxl::Mat4f32 viewToClipMat;
+    vxl::Mat4f32 clipToViewMat;
+    vxl::Mat4f32 worldToViewMat;
+    vxl::Mat4f32 viewToWorldMat;
+
+    int renderWidth;
+    int renderHeight;
+    float renderAspect;
+};
 
 template <typename T>
 class NerfNetwork;
@@ -186,7 +226,6 @@ public:
                                    uint32_t padded_output_width,
                                    uint32_t n_extra_dims,
                                    const ivec2& resolution,
-                                   int slice_count,
                                    const vec2& focal_length,
                                    const mat4x3& camera_matrix0,
                                    const mat4x3& camera_matrix1,
@@ -212,6 +251,38 @@ public:
                                    float cone_angle_constant,
                                    ERenderMode render_mode,
                                    cudaStream_t stream);
+
+        void init_rays_from_camera_mosaic(const MosaicData& mosaic,
+                                          const MosaicViewData& mosaicViewData,
+                                          uint32_t spp,
+                                          uint32_t padded_output_width,
+                                          uint32_t n_extra_dims,
+                                          const ivec2& resolution,
+                                          const vec2& focal_length,
+                                          const mat4x3& camera_matrix0,
+                                          const mat4x3& camera_matrix1,
+                                          const vec4& rolling_shutter,
+                                          const vec2& screen_center,
+                                          const vec3& parallax_shift,
+                                          bool snap_to_pixel_centers,
+                                          const BoundingBox& render_aabb,
+                                          const mat3& render_aabb_to_local,
+                                          float near_distance,
+                                          float plane_z,
+                                          float aperture_size,
+                                          const Foveation& foveation,
+                                          const Lens& lens,
+                                          const Buffer2DView<const vec4>& envmap,
+                                          const Buffer2DView<const vec2>& distortion,
+                                          vec4* frame_buffer,
+                                          float* depth_buffer,
+                                          const Buffer2DView<const uint8_t>& hidden_area_mask,
+                                          const uint8_t* grid,
+                                          int show_accel,
+                                          uint32_t max_mip,
+                                          float cone_angle_constant,
+                                          ERenderMode render_mode,
+                                          cudaStream_t stream);
 
         uint32_t debug_rays(uint32_t n_rays, const RaysNerfSoa& rays, cudaStream_t stream, float plane_z = 0);
 
@@ -286,7 +357,7 @@ public:
         uint32_t m_n_rays_initialized = 0;
         GPUMemoryArena::Allocation m_scratch_alloc;
 
-		friend class Testbed;
+        friend class Testbed;
     };
 
     class FiniteDifferenceNormalsApproximator
@@ -378,18 +449,18 @@ public:
 
     class CudaDevice;
 
-	 void render_nerf_slices(cudaStream_t stream,
-                                        CudaDevice& device,
-                                        const CudaRenderBufferView& render_buffer,
-                                        const std::shared_ptr<NerfNetwork<network_precision_t>>& nerf_network,
-                                        const uint8_t* density_grid_bitfield,
-                                        const vec2& focal_length,
-                                        const mat4x3& camera_matrix0,
-                                        const mat4x3& camera_matrix1,
-                                        const vec4& rolling_shutter,
-                                        const vec2& screen_center,
-                                        const Foveation& foveation,
-                                        int visualized_dimension);
+    void render_nerf_slices(cudaStream_t stream,
+                            CudaDevice& device,
+                            const CudaRenderBufferView& render_buffer,
+                            const std::shared_ptr<NerfNetwork<network_precision_t>>& nerf_network,
+                            const uint8_t* density_grid_bitfield,
+                            const vec2& focal_length,
+                            const mat4x3& camera_matrix0,
+                            const mat4x3& camera_matrix1,
+                            const vec4& rolling_shutter,
+                            const vec2& screen_center,
+                            const Foveation& foveation,
+                            int visualized_dimension);
     void render_nerf(cudaStream_t stream,
                      CudaDevice& device,
                      const CudaRenderBufferView& render_buffer,
@@ -613,6 +684,7 @@ public:
                          bool force_use_octree               = true);
     void draw_visualizations(ImDrawList* list, const mat4x3& camera_matrix);
     void train_and_render(bool skip_rendering);
+    void simple_render();
     fs::path training_data_path() const;
     void init_window(int resw, int resh, bool hidden = false, bool second_window = false);
     void destroy_window();
@@ -1120,11 +1192,8 @@ public:
     std::chrono::time_point<std::chrono::steady_clock> m_training_start_time_point;
     vec4 m_background_color = {0.0f, 0.0f, 0.0f, 1.0f};
 
-    float m_delta_z = 1;
-    int m_slice_count = 4;
-    float m_quiltFocusDistance = 1;
-    float m_quiltViewConeFovDegX = 45.f;
-    ivec2 m_view_tiles = ivec2{1,1};
+    MosaicData m_mosaic;
+    MosaicViewData m_mosaicViewData;
 
     bool m_vsync                               = false;
     bool m_render_transparency_as_checkerboard = false;
