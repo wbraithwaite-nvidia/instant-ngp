@@ -86,11 +86,13 @@ struct MosaicData
     ivec2 m_view_tiles           = ivec2{1, 1};
 };
 
+//using MosaicViewData = nvpv::RenderViewData;
 struct MosaicViewData
 {
     float focalDistance;
     float viewCamTanHalfFovX;
     float viewConeHalfFovX;
+    float imageViewAspect;
     float imageViewAspectInv;
     vxl::Vec2s32 mosaicTileSize;
     vxl::Vec2s32 mosaicTileCount;

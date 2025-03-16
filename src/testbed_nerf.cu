@@ -130,7 +130,7 @@ OPENVXL_CUDA_INLINE void getRay(vxl::Vec3f32& ro,
                                              renderViewData.viewConeHalfFovX,
                                              renderViewData.viewConeHalfFovX,
                                              renderViewData.focalDistance);
-
+#if 0
     float mx = (tileU * 2 - 1) / renderViewData.renderAspect;
     mx -= (viewOffset[0] / (renderViewData.viewCamTanHalfFovX * renderViewData.focalDistance)) /
           renderViewData.renderAspect;
@@ -146,6 +146,28 @@ OPENVXL_CUDA_INLINE void getRay(vxl::Vec3f32& ro,
                                    ((tileV * 2 - 1) * renderViewData.imageViewAspectInv) * 0.5f + 0.5f};
 
     rd = getRayDir(rayPlaneOffset[0], rayPlaneOffset[1], renderViewData.clipToViewMat, renderViewData.viewToWorldMat);
+#else
+
+    ro = getRayPos(renderViewData.viewToWorldMat);
+    // offset in the plane. OPT: make this faster!
+    ro += renderViewData.viewToWorldMat.getRotationMatrix() * vxl::Vec3f32(viewOffset[0], viewOffset[1], 0.0f);
+
+    float pixelAspect = renderViewData.renderAspect / renderViewData.imageViewAspect;
+
+    // offset the projection...
+
+    float mx = (tileU * 2 - 1);
+    mx -= (viewOffset[0] / (renderViewData.viewCamTanHalfFovX * renderViewData.focalDistance));
+    //mx *= pixelAspect;
+	
+    // get the uv coord in the plane for this ray.
+    // Note it is offseted by view-separation and squished for preserving aspect.
+    // we also use imageViewAspectInv to squish the ray dir vertically.
+
+    vxl::Vec2f32 rayPlaneOffset = {(mx * 0.5f + 0.5f), (tileV * 2 - 1) * 0.5f + 0.5f};
+
+    rd = getRayDir(rayPlaneOffset[0], rayPlaneOffset[1], renderViewData.clipToViewMat, renderViewData.viewToWorldMat);
+#endif
 }
 
 } // namespace vxl_ext
@@ -2877,46 +2899,46 @@ __global__ void init_rays_with_payload_kernel_nerf(uint32_t sample_index,
     mat4x3 camera = get_xform_given_rolling_shutter(
         {camera_matrix0, camera_matrix1}, rolling_shutter, uv, ld_random_val(sample_index, idx * 72239731));
 
-	Ray ray;
+    Ray ray;
 
-	if (renderViewData.mosaicTileCount[0] > 1)
+    if (renderViewData.mosaicTileCount[0] > 1)
     {
-		// compute quilt mosaic position...
-		int ix             = x;
-		int iy             = (resolution.y - y) - 1;
-		float viewportU    = (float) (ix * renderViewData.mosaicTileCount[0]) / resolution.x;
-		float viewportV    = (float) (iy * renderViewData.mosaicTileCount[1]) / resolution.y;
-		auto viewportIndex = vxl::Vec2s32(vxl::floor(viewportU), vxl::floor(viewportV));
-		viewportU -= viewportIndex[0];
-		viewportV -= viewportIndex[1];
+        // compute quilt mosaic position...
+        int ix             = x;
+        int iy             = (resolution.y - y) - 1;
+        float viewportU    = (float) (ix * renderViewData.mosaicTileCount[0]) / resolution.x;
+        float viewportV    = (float) (iy * renderViewData.mosaicTileCount[1]) / resolution.y;
+        auto viewportIndex = vxl::Vec2s32(vxl::floor(viewportU), vxl::floor(viewportV));
+        viewportU -= viewportIndex[0];
+        viewportV -= viewportIndex[1];
 
-		// add jitter
-		viewportU += pixel_offset.x / resolution.x;
-		viewportV += pixel_offset.y / resolution.y;
+        // add jitter
+        viewportU += pixel_offset.x / resolution.x;
+        viewportV += pixel_offset.y / resolution.y;
 
-		vxl::Vec3f32 ro, rd;
-		vxl_ext::getRay(ro, rd, viewportIndex[0], viewportIndex[1], viewportU, viewportV, renderViewData);
+        vxl::Vec3f32 ro, rd;
+        vxl_ext::getRay(ro, rd, viewportIndex[0], viewportIndex[1], viewportU, viewportV, renderViewData);
 
-		ray.o = vec3{ro[0], ro[1], ro[2]};
-		ray.d = vec3{rd[0], rd[1], rd[2]};
+        ray.o = vec3{ro[0], ro[1], ro[2]};
+        ray.d = vec3{rd[0], rd[1], rd[2]};
 
-		ray.o += ray.d * near_distance;
+        ray.o += ray.d * near_distance;
 
-		if (false)
-		{
-			NerfPayload& payload    = payloads[idx];
-			frame_buffer[idx].rgb() = vec3(viewportU, viewportV, 0);
-			frame_buffer[idx].a     = 1.0f;
-			depth_buffer[idx]       = 1.0f;
-			payload.origin          = ray(MAX_DEPTH());
-			payload.alive           = false;
-			return;
-		}
-	}
-	else
+        if (false)
+        {
+            NerfPayload& payload    = payloads[idx];
+            frame_buffer[idx].rgb() = vec3(viewportU, viewportV, 0);
+            frame_buffer[idx].a     = 1.0f;
+            depth_buffer[idx]       = 1.0f;
+            payload.origin          = ray(MAX_DEPTH());
+            payload.alive           = false;
+            return;
+        }
+    }
+    else
     {
-    // get the ray for the uv position...
-     ray = uv_to_ray(sample_index,
+        // get the ray for the uv position...
+        ray = uv_to_ray(sample_index,
                         uv,
                         resolution,
                         focal_length,
@@ -2930,7 +2952,7 @@ __global__ void init_rays_with_payload_kernel_nerf(uint32_t sample_index,
                         hidden_area_mask,
                         lens,
                         distortion);
-	}
+    }
 
     // initialize the payload...
     NerfPayload& payload = payloads[idx];
