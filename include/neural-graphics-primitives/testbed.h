@@ -821,6 +821,8 @@ public:
     float m_bounding_radius = 1;
     float m_exposure        = 0.f;
 
+	float m_depth_threshold = 0.2f;
+
     ERenderMode m_render_mode          = ERenderMode::Shade;
     EMeshRenderMode m_mesh_render_mode = EMeshRenderMode::VertexNormals;
 

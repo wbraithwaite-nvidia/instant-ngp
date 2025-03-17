@@ -2206,6 +2206,7 @@ __global__ void shade_kernel_nerf(const uint32_t n_elements,
                                   NerfPayload* __restrict__ payloads,
                                   ERenderMode render_mode,
                                   bool train_in_linear_colors,
+                                  float depth_threshold,
                                   vec4* __restrict__ frame_buffer,
                                   float* __restrict__ depth_buffer)
 {
@@ -2280,12 +2281,18 @@ __global__ void shade_kernel_nerf(const uint32_t n_elements,
         tmp = vec4(color[0], color[1], color[2], 1.f);
     }
 
-    frame_buffer[payload.idx] = tmp + frame_buffer[payload.idx] * (1.0f - tmp.a);
-
-    if (render_mode != ERenderMode::Slice && tmp.a > 0.2f)
+    if (render_mode != ERenderMode::Slice && tmp.a > depth_threshold)
     {
         depth_buffer[payload.idx] = depth[i][slice_i];
+
     }
+    else
+    {
+        // make the pixel transparent if we are not drawing the depth!
+        tmp.a = 0.f;
+	}
+
+	frame_buffer[payload.idx]        = tmp + frame_buffer[payload.idx] * (1.0f - tmp.a);
 }
 
 //----------------------------------------------------------------------------------------------
@@ -4203,6 +4210,7 @@ void Testbed::render_nerf(cudaStream_t stream,
                       rays_hit.payload,
                       m_render_mode,
                       m_nerf.training.linear_colors,
+                      m_depth_threshold,
                       render_buffer.frame_buffer,
                       render_buffer.depth_buffer);
     }
