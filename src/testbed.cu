@@ -206,7 +206,8 @@ void Testbed::set_mode(ETestbedMode mode)
     m_volume = Volume{};
 
     // this seems like a bad idea..
-    //m_nerf   = {};
+	if (m_current_nerf)
+		nerf()   = {};
 
     // Kill training-related things
 	if (m_current_per_frame_data)

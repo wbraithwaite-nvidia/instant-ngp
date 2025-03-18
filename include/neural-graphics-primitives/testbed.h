@@ -1143,24 +1143,28 @@ public:
 
     PerFrameData& frame()
     {
+		//std:: cout << "m_current_per_frame_data: " << m_current_per_frame_data << "\n";
         assert(m_current_per_frame_data);
         return *m_current_per_frame_data.get();
     }
 
     const PerFrameData& frame() const
     {
+		//std:: cout << "m_current_per_frame_data: " << m_current_per_frame_data << "\n";
         assert(m_current_per_frame_data);
         return *m_current_per_frame_data.get();
     }
 
     Nerf& nerf()
     {
+		//std::cout << "m_current_nerf: " << m_current_per_frame_data << "\n";
         assert(m_current_nerf);
         return *m_current_nerf.get();
     }
 
     const Nerf& nerf() const
     {
+		//std:: cout << "m_current_nerf: " << m_current_per_frame_data << "\n";
         assert(m_current_nerf);
         return *m_current_nerf.get();
     }
