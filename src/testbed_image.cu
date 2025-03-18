@@ -221,9 +221,9 @@ void Testbed::train_image(size_t target_batch_size, bool get_loss_scalar, cudaSt
 
 	auto generate_training_data = [&]() {
 		if (m_image.random_mode == ERandomMode::Halton) {
-			linear_kernel(halton23_kernel, 0, stream, n_elements, (size_t)batch_size * m_training_step, m_image.training.positions.data());
+			linear_kernel(halton23_kernel, 0, stream, n_elements, (size_t)batch_size * frame().m_training_step, m_image.training.positions.data());
 		} else if (m_image.random_mode == ERandomMode::Sobol) {
-			linear_kernel(sobol2_kernel, 0, stream, n_elements, (size_t)batch_size * m_training_step, m_seed, m_image.training.positions.data());
+			linear_kernel(sobol2_kernel, 0, stream, n_elements, (size_t)batch_size * frame().m_training_step, m_seed, m_image.training.positions.data());
 		} else {
 			generate_random_uniform<float>(stream, m_rng, n_elements * n_input_dims, (float*)m_image.training.positions.data());
 			if (m_image.random_mode == ERandomMode::Stratified) {
@@ -266,12 +266,12 @@ void Testbed::train_image(size_t target_batch_size, bool get_loss_scalar, cudaSt
 	GPUMatrix<float> training_batch_matrix((float*)(m_image.training.positions.data()), n_input_dims, batch_size);
 	GPUMatrix<float> training_target_matrix((float*)(m_image.training.targets.data()), n_output_dims, batch_size);
 
-	auto ctx = m_trainer->training_step(stream, training_batch_matrix, training_target_matrix);
+	auto ctx = frame().m_trainer->training_step(stream, training_batch_matrix, training_target_matrix);
 	if (get_loss_scalar) {
-		m_loss_scalar.update(m_trainer->loss(stream, *ctx));
+		frame().m_loss_scalar.update(frame().m_trainer->loss(stream, *ctx));
 	}
 
-	m_training_step++;
+	frame().m_training_step++;
 }
 
 void Testbed::render_image(
@@ -341,11 +341,11 @@ void Testbed::render_image(
 		if (visualized_dimension >= 0) {
 			GPUMatrix<float> positions_matrix((float*)m_image.render_coords.data(), 2, n_elements);
 			GPUMatrix<float> colors_matrix((float*)m_image.render_out.data(), 3, n_elements);
-			m_network->visualize_activation(stream, m_visualized_layer, visualized_dimension, positions_matrix, colors_matrix);
+			frame().m_network->visualize_activation(stream, m_visualized_layer, visualized_dimension, positions_matrix, colors_matrix);
 		} else {
 			GPUMatrix<float> positions_matrix((float*)m_image.render_coords.data(), 2, n_elements);
 			GPUMatrix<float> colors_matrix((float*)m_image.render_out.data(), 3, n_elements);
-			m_network->inference(stream, positions_matrix, colors_matrix);
+			frame().m_network->inference(stream, positions_matrix, colors_matrix);
 		}
 	}
 
@@ -502,7 +502,7 @@ float Testbed::compute_image_mse(bool quantize_to_byte) {
 			);
 		}
 
-		m_network->inference(pos_matrix, predictions_matrix);
+		frame().m_network->inference(pos_matrix, predictions_matrix);
 
 		linear_kernel(image_mse_kernel, 0, nullptr,
 			batch_size,

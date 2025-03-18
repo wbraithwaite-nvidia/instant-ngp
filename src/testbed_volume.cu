@@ -191,12 +191,12 @@ void Testbed::train_volume(size_t target_batch_size, bool get_loss_scalar, cudaS
 	GPUMatrix<float> training_batch_matrix((float*)(m_volume.training.positions.data()), n_input_dims, batch_size);
 	GPUMatrix<float> training_target_matrix((float*)(m_volume.training.targets.data()), n_output_dims, batch_size);
 
-	auto ctx = m_trainer->training_step(stream, training_batch_matrix, training_target_matrix);
+	auto ctx = frame().m_trainer->training_step(stream, training_batch_matrix, training_target_matrix);
 
-	m_training_step++;
+	frame().m_training_step++;
 
 	if (get_loss_scalar) {
-		m_loss_scalar.update(m_trainer->loss(stream, *ctx));
+		frame().m_loss_scalar.update(frame().m_trainer->loss(stream, *ctx));
 	}
 }
 
@@ -448,7 +448,7 @@ void Testbed::render_volume(
 		plane_z,
 		m_aperture_size,
 		foveation,
-		m_envmap.inference_view(),
+		frame().m_envmap.inference_view(),
 		render_buffer.frame_buffer,
 		render_buffer.depth_buffer,
 		render_buffer.hidden_area_mask ? render_buffer.hidden_area_mask->const_view() : Buffer2DView<const uint8_t>{},
@@ -501,7 +501,7 @@ void Testbed::render_volume(
 			uint32_t n_elements = next_multiple(n, BATCH_SIZE_GRANULARITY);
 			GPUMatrix<float> positions_matrix((float*)m_volume.pos[srcbuf].data(), 3, n_elements);
 			GPUMatrix<float> densities_matrix((float*)m_volume.radiance_and_density.data(), 4, n_elements);
-			m_network->inference(stream, positions_matrix, densities_matrix);
+			frame().m_network->inference(stream, positions_matrix, densities_matrix);
 
 			CUDA_CHECK_THROW(cudaMemsetAsync(m_volume.hit_counter.data() + dstbuf, 0, sizeof(uint32_t), stream));
 

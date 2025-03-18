@@ -917,7 +917,7 @@ void Testbed::render_sdf(
 		plane_z,
 		m_aperture_size,
 		foveation,
-		m_envmap.inference_view(),
+		frame().m_envmap.inference_view(),
 		render_buffer.frame_buffer,
 		render_buffer.depth_buffer,
 		render_buffer.hidden_area_mask ? render_buffer.hidden_area_mask->const_view() : Buffer2DView<const uint8_t>{},
@@ -965,7 +965,7 @@ void Testbed::render_sdf(
 
 			GPUMatrix<float> positions_matrix((float*)rays_hit.pos, 3, n_elements);
 			GPUMatrix<float> colors_matrix((float*)rays_hit.normal, 3, n_elements);
-			m_network->visualize_activation(stream, m_visualized_layer, visualized_dimension, positions_matrix, colors_matrix);
+			frame().m_network->visualize_activation(stream, m_visualized_layer, visualized_dimension, positions_matrix, colors_matrix);
 		}
 	}
 
@@ -1026,7 +1026,7 @@ void Testbed::render_sdf(
 
 		GPUMatrix<float> positions_matrix((float*)rays_hit.pos, 3, n_elements);
 		GPUMatrix<float> colors_matrix((float*)rays_hit.normal, 3, n_elements);
-		m_network->visualize_activation(stream, m_visualized_layer, visualized_dimension, positions_matrix, colors_matrix);
+		frame().m_network->visualize_activation(stream, m_visualized_layer, visualized_dimension, positions_matrix, colors_matrix);
 	}
 
 	linear_kernel(shade_kernel_sdf, 0, stream,
@@ -1327,18 +1327,18 @@ void Testbed::train_sdf(size_t target_batch_size, bool get_loss_scalar, cudaStre
 		const uint32_t batch_size = (uint32_t)std::min(m_sdf.training.size, target_batch_size);
 
 		// Permute all training records to de-correlate training data
-		linear_kernel(shuffle<vec3>, 0, stream, m_sdf.training.size, 1, m_training_step, m_sdf.training.positions.data(), m_sdf.training.positions_shuffled.data());
-		linear_kernel(shuffle<float>, 0, stream, m_sdf.training.size, 1, m_training_step, m_sdf.training.distances.data(), m_sdf.training.distances_shuffled.data());
+		linear_kernel(shuffle<vec3>, 0, stream, m_sdf.training.size, 1, frame().m_training_step, m_sdf.training.positions.data(), m_sdf.training.positions_shuffled.data());
+		linear_kernel(shuffle<float>, 0, stream, m_sdf.training.size, 1, frame().m_training_step, m_sdf.training.distances.data(), m_sdf.training.distances_shuffled.data());
 
 		GPUMatrix<float> training_target_matrix(m_sdf.training.distances_shuffled.data(), n_output_dims, batch_size);
 		GPUMatrix<float> training_batch_matrix((float*)(m_sdf.training.positions_shuffled.data()), n_input_dims, batch_size);
 
-		auto ctx = m_trainer->training_step(stream, training_batch_matrix, training_target_matrix);
+		auto ctx = frame().m_trainer->training_step(stream, training_batch_matrix, training_target_matrix);
 
-		m_training_step++;
+		frame().m_training_step++;
 
 		if (get_loss_scalar) {
-			m_loss_scalar.update(m_trainer->loss(stream, *ctx));
+			frame().m_loss_scalar.update(frame().m_trainer->loss(stream, *ctx));
 		}
 	}
 }
@@ -1379,7 +1379,7 @@ double Testbed::calculate_iou(uint32_t n_samples, float scale_existing_results_f
 		generate_training_samples_sdf(m_sdf.training.positions.data(), m_sdf.training.distances.data(), (uint32_t)(batch_size), stream, true);
 		GPUMatrix<float> positions_matrix((float*)m_sdf.training.positions.data(), 3, batch_size);
 		GPUMatrix<float> distances_matrix(m_sdf.training.distances_shuffled.data(), 1, batch_size);
-		m_network->inference(stream, positions_matrix, distances_matrix);
+		frame().m_network->inference(stream, positions_matrix, distances_matrix);
 		auto* octree_ptr = (m_sdf.uses_takikawa_encoding || m_sdf.use_triangle_octree || force_use_octree) ? m_sdf.triangle_octree.get() : nullptr;
 		linear_kernel(compare_signs_kernel,0, stream, batch_size, m_sdf.training.positions.data(),
 			m_sdf.training.distances.data(), //  ref

@@ -183,7 +183,7 @@ int main_func(const std::vector<std::string>& arguments) {
 	// Render/training loop
 	while (testbed.frame()) {
 		if (!gui) {
-			tlog::info() << "iteration=" << testbed.m_training_step << " loss=" << testbed.m_loss_scalar.val();
+			tlog::info() << "iteration=" << testbed.frame().m_training_step << " loss=" << testbed.frame().m_loss_scalar.val();
 		}
 	}
 

@@ -171,7 +171,7 @@ void Testbed::load_training_data(const fs::path& path)
     default: throw std::runtime_error{"Invalid testbed mode."};
     }
 
-    m_training_data_available = true;
+    frame().m_training_data_available = true;
 
     update_imgui_paths();
 }
@@ -186,7 +186,9 @@ void Testbed::reload_training_data()
 
 void Testbed::clear_training_data()
 {
-    m_training_data_available = false;
+    auto& m_nerf = nerf();
+
+    frame().m_training_data_available = false;
     m_nerf.training.dataset.metadata.clear();
 }
 
@@ -200,20 +202,15 @@ void Testbed::set_mode(ETestbedMode mode)
     // Reset mode-specific members
     m_image  = {};
     m_mesh   = {};
-    m_nerf   = {};
     m_sdf    = {};
     m_volume = Volume{};
 
+    // this seems like a bad idea..
+    //m_nerf   = {};
+
     // Kill training-related things
-    m_encoding                = {};
-    m_loss                    = {};
-    m_network                 = {};
-    m_nerf_network            = {};
-    m_optimizer               = {};
-    m_trainer                 = {};
-    m_envmap                  = {};
-    m_distortion              = {};
-    m_training_data_available = false;
+	if (m_current_per_frame_data)
+	    frame().clear();
 
     // Clear device-owned data that might be mode-specific
     for (auto&& device : m_devices)
@@ -357,7 +354,7 @@ void Testbed::reload_network_from_file(const fs::path& path)
         auto config = load_network_config(full_network_config_path);
         if (!config.is_null())
         {
-            m_network_config = config;
+            frame().m_network_config = config;
             //HACK: remember the path
             m_network_config_path = full_network_config_path;
         }
@@ -375,16 +372,75 @@ void Testbed::reload_network_from_json(const json& json, const std::string& conf
 {
     // config_base_path is needed so that if the passed in json uses the 'parent' feature, we know where to look...
     // be sure to use a filename, or if a directory, end with a trailing slash
-    m_network_config = merge_parent_network_config(json, config_base_path);
+    frame().m_network_config = merge_parent_network_config(json, config_base_path);
     reset_network();
+}
+
+bool Testbed::acquire_nerf(const std::string& key)
+{
+    /*if (fs::path(key).extension() == "json")
+	{
+		m_current_nerf = m_training_nerf;
+		return false;
+	}*/
+
+    auto it = m_nerf_cache_map.find(key);
+    if (it != m_nerf_cache_map.end())
+    {
+        m_current_nerf           = it->second;
+        m_current_per_frame_data = m_per_frame_cache_map.at(key);
+
+        return true;
+    }
+
+    m_current_nerf = std::make_shared<Nerf>();
+    m_nerf_cache_map.insert({key, m_current_nerf});
+
+    m_current_per_frame_data = std::make_shared<PerFrameData>();
+    m_per_frame_cache_map.insert({key, m_current_per_frame_data});
+
+    frame().m_network_config = {
+        {"loss", {{"otype", "L2"}}},
+        {"optimizer",
+         {
+             {"otype", "Adam"},
+             {"learning_rate", 1e-3},
+             {"beta1", 0.9f},
+             {"beta2", 0.99f},
+             {"epsilon", 1e-15f},
+             {"l2_reg", 1e-6f},
+         }},
+        {"encoding",
+         {
+             {"otype", "HashGrid"},
+             {"n_levels", 16},
+             {"n_features_per_level", 2},
+             {"log2_hashmap_size", 19},
+             {"base_resolution", 16},
+         }},
+        {"network",
+         {
+             {"otype", "FullyFusedMLP"},
+             {"n_neurons", 64},
+             {"n_layers", 2},
+             {"activation", "ReLU"},
+             {"output_activation", "None"},
+         }},
+    };
+
+    return false;
 }
 
 void Testbed::load_file(const fs::path& path)
 {
+    // HACK:
+    bool is_json = equals_case_insensitive(path.extension(), "json");
+	bool is_ingp = equals_case_insensitive(path.extension(), "ingp");
+
     if (!path.exists())
     {
         // If the path doesn't exist, but a network config can be resolved, load that.
-        if (equals_case_insensitive(path.extension(), "json") && find_network_config(path).exists())
+        if (is_json && find_network_config(path).exists())
         {
             reload_network_from_file(path);
             return;
@@ -392,6 +448,38 @@ void Testbed::load_file(const fs::path& path)
 
         tlog::error() << "File '" << path.str() << "' does not exist.";
         return;
+    }
+
+    // HACK: let's acquire a new slot...
+    bool is_resident = acquire_nerf(path.str());
+
+    // HACK: to prevent this caching being used for training.
+    if (is_resident)
+    {
+        // just update...
+        auto& m_nerf = nerf();
+
+        //reset_network(false);
+
+		if (is_ingp)
+		{
+			reset_network(false);
+			frame().m_training_step = frame().m_network_config["snapshot"]["training_step"];
+			frame().m_loss_scalar.set(frame().m_network_config["snapshot"]["loss"]);
+			frame().m_trainer->deserialize(frame().m_network_config["snapshot"]);
+			load_nerf_post();
+			//m_nerf.rgb_activation     = ngp::ENerfActivation::Exponential;
+			//m_nerf.density_activation = ngp::ENerfActivation::Exponential;
+		}
+		set_all_devices_dirty();
+
+        return;
+    }
+    else
+    {
+		// do we need to reset the networks?
+        //m_testbed_mode = ETestbedMode::None;
+        //set_mode(ETestbedMode::Nerf);
     }
 
     if (equals_case_insensitive(path.extension(), "ingp") || equals_case_insensitive(path.extension(), "msgpack"))
@@ -435,7 +523,7 @@ void Testbed::load_file(const fs::path& path)
     // If the dragged file isn't any of the above, assume that it's training data
     try
     {
-        bool was_training_data_available = m_training_data_available;
+        bool was_training_data_available = frame().m_training_data_available;
         load_training_data(path);
 
         if (!was_training_data_available)
@@ -489,7 +577,8 @@ void Testbed::translate_camera(const vec3& rel, const mat3& rot, bool allow_up_d
 
 void Testbed::set_nerf_camera_matrix(const mat4x3& cam)
 {
-    m_camera = m_nerf.training.dataset.nerf_matrix_to_ngp(cam);
+    auto& m_nerf = nerf();
+    m_camera     = m_nerf.training.dataset.nerf_matrix_to_ngp(cam);
 }
 
 vec3 Testbed::look_at() const
@@ -520,18 +609,22 @@ void Testbed::set_view_dir(const vec3& dir)
 
 void Testbed::first_training_view()
 {
+    auto& m_nerf         = nerf();
     m_nerf.training.view = 0;
     set_camera_to_training_view(m_nerf.training.view);
 }
 
 void Testbed::last_training_view()
 {
+    auto& m_nerf         = nerf();
     m_nerf.training.view = m_nerf.training.dataset.n_images - 1;
     set_camera_to_training_view(m_nerf.training.view);
 }
 
 void Testbed::previous_training_view()
 {
+    auto& m_nerf = nerf();
+
     if (m_nerf.training.view != 0)
     {
         m_nerf.training.view -= 1;
@@ -542,6 +635,8 @@ void Testbed::previous_training_view()
 
 void Testbed::next_training_view()
 {
+    auto& m_nerf = nerf();
+
     if (m_nerf.training.view != m_nerf.training.dataset.n_images - 1)
     {
         m_nerf.training.view += 1;
@@ -552,6 +647,8 @@ void Testbed::next_training_view()
 
 void Testbed::set_camera_to_training_view(int trainview)
 {
+    auto& m_nerf = nerf();
+
     auto old_look_at = look_at();
     m_camera         = m_smoothed_camera =
         get_xform_given_rolling_shutter(m_nerf.training.transforms[trainview],
@@ -617,6 +714,8 @@ void Testbed::compute_and_save_marching_cubes_mesh(const fs::path& filename,
                                                    float thresh,
                                                    bool unwrap_it)
 {
+    auto& m_nerf = nerf();
+
     mat3 render_aabb_to_local = mat3::identity();
     if (aabb.is_empty())
     {
@@ -696,7 +795,7 @@ inline float linear_to_db(float x)
 template <typename T>
 void Testbed::dump_parameters_as_images(const T* params, const std::string& filename_base)
 {
-    if (!m_network)
+    if (!frame().m_network)
     {
         return;
     }
@@ -704,12 +803,12 @@ void Testbed::dump_parameters_as_images(const T* params, const std::string& file
     size_t non_layer_params_width = 2048;
 
     size_t layer_params = 0;
-    for (auto size : m_network->layer_sizes())
+    for (auto size : frame().m_network->layer_sizes())
     {
         layer_params += size.first * size.second;
     }
 
-    size_t n_params           = m_network->n_params();
+    size_t n_params           = frame().m_network->n_params();
     size_t n_non_layer_params = n_params - layer_params;
 
     std::vector<T> params_cpu_network_precision(layer_params +
@@ -725,7 +824,7 @@ void Testbed::dump_parameters_as_images(const T* params, const std::string& file
 
     size_t offset   = 0;
     size_t layer_id = 0;
-    for (auto size : m_network->layer_sizes())
+    for (auto size : frame().m_network->layer_sizes())
     {
         save_exr(params_cpu.data() + offset,
                  size.second,
@@ -766,6 +865,8 @@ mat4x3 Testbed::crop_box(bool nerf_space) const
     rv[3] = cen;
     if (nerf_space)
     {
+        auto& m_nerf = nerf();
+
         rv = m_nerf.training.dataset.ngp_matrix_to_nerf(rv, true);
     }
     return rv;
@@ -775,6 +876,8 @@ void Testbed::set_crop_box(mat4x3 m, bool nerf_space)
 {
     if (nerf_space)
     {
+        auto& m_nerf = nerf();
+
         m = m_nerf.training.dataset.nerf_matrix_to_ngp(m, true);
     }
 
@@ -811,6 +914,8 @@ std::vector<vec3> Testbed::crop_box_corners(bool nerf_space) const
             a   = m * a;
             if (nerf_space)
             {
+                auto& m_nerf = nerf();
+
                 a = m_nerf.training.dataset.ngp_position_to_nerf(a);
             }
             tlog::info() << a.x << "," << a.y << "," << a.z << " [" << i << "]";
@@ -1236,9 +1341,9 @@ void Testbed::imgui()
         float elapsed_training =
             std::chrono::duration<float>(std::chrono::steady_clock::now() - m_training_start_time_point).count();
         ImGui::Text("Steps: %d, Loss: %0.6f (%0.2f dB), Elapsed: %.1fs",
-                    m_training_step,
-                    m_loss_scalar.ema_val(),
-                    linear_to_db(m_loss_scalar.ema_val()),
+                    frame().m_training_step,
+                    frame().m_loss_scalar.ema_val(),
+                    linear_to_db(frame().m_loss_scalar.ema_val()),
                     elapsed_training);
         ImGui::PlotLines(
             "loss graph",
@@ -2055,7 +2160,7 @@ void Testbed::imgui()
         ImGui::SameLine();
         if (ImGui::Button("Dump parameters as images"))
         {
-            dump_parameters_as_images(m_trainer->params(), "params");
+            dump_parameters_as_images(frame().m_trainer->params(), "params");
         }
 
         ImGui::SameLine();
@@ -3510,10 +3615,10 @@ void Testbed::train_and_render(bool skip_rendering)
 
     // If we don't have a trainer, as can happen when having loaded training data or changed modes without having
     // explicitly loaded a new neural network.
-    if (m_testbed_mode != ETestbedMode::None && !m_network)
+    if (m_testbed_mode != ETestbedMode::None && !frame().m_network)
     {
         reload_network_from_file();
-        if (!m_network)
+        if (!frame().m_network)
         {
             throw std::runtime_error{"Unable to reload neural network."};
         }
@@ -3638,6 +3743,8 @@ void Testbed::train_and_render(bool skip_rendering)
 
     if (m_dlss)
     {
+        auto& m_nerf = nerf();
+
         m_aperture_size = 0.0f;
         if (!supports_dlss(m_nerf.render_lens.mode))
         {
@@ -3660,7 +3767,7 @@ void Testbed::train_and_render(bool skip_rendering)
             n_pixels_full_res += product(view.full_resolution);
         }
 
-        float pixel_ratio = (n_pixels == 0 || (m_train && m_training_step == 0))
+        float pixel_ratio = (n_pixels == 0 || (m_train && frame().m_training_step == 0))
                                 ? (1.0f / 256.0f)
                                 : ((float) n_pixels / (float) n_pixels_full_res);
 
@@ -3845,6 +3952,8 @@ void Testbed::train_and_render(bool skip_rendering)
 //-----------------------------------------------------------------------------------------
 void Testbed::simple_render()
 {
+    auto& m_nerf = nerf();
+
     auto smoothed_camera_backup = m_smoothed_camera;
 
     // Don't do any smoothing here if a camera path is being rendered. It'll take care
@@ -4444,7 +4553,7 @@ void Testbed::update_vr_performance_settings()
 #endif //NGP_GUI
 }
 
-bool Testbed::frame()
+bool Testbed::vr_frame()
 {
 #ifdef NGP_GUI
     if (m_render_window)
@@ -4461,7 +4570,7 @@ bool Testbed::frame()
 
     // Render against the trained neural network. If we're training and already close to convergence,
     // we can skip rendering if the scene camera doesn't change
-    uint32_t n_to_skip = m_train ? clamp(m_training_step / 16u, 15u, 255u) : 0;
+    uint32_t n_to_skip = m_train ? clamp(frame().m_training_step / 16u, 15u, 255u) : 0;
     if (m_render_skip_due_to_lack_of_camera_movement_counter > n_to_skip)
     {
         m_render_skip_due_to_lack_of_camera_movement_counter = 0;
@@ -4597,12 +4706,16 @@ void Testbed::apply_camera_smoothing(float elapsed_ms)
 
 CameraKeyframe Testbed::copy_camera_to_keyframe() const
 {
+    auto& m_nerf = nerf();
+
     return CameraKeyframe(
         m_camera, m_slice_plane_z, m_scale, fov(), m_aperture_size, m_nerf.glow_mode, m_nerf.glow_y_cutoff);
 }
 
 void Testbed::set_camera_from_keyframe(const CameraKeyframe& k)
 {
+    auto& m_nerf = nerf();
+
     m_camera        = k.m();
     m_slice_plane_z = k.slice;
     m_scale         = k.scale;
@@ -4624,12 +4737,12 @@ void Testbed::set_camera_from_time(float t)
 
 void Testbed::update_loss_graph()
 {
-    m_loss_graph[m_loss_graph_samples++ % m_loss_graph.size()] = std::log(m_loss_scalar.val());
+    m_loss_graph[m_loss_graph_samples++ % m_loss_graph.size()] = std::log(frame().m_loss_scalar.val());
 }
 
 uint32_t Testbed::n_dimensions_to_visualize() const
 {
-    return m_network ? m_network->width(m_visualized_layer) : 0;
+    return frame().m_network ? frame().m_network->width(m_visualized_layer) : 0;
 }
 
 float Testbed::fov() const
@@ -4654,7 +4767,7 @@ void Testbed::set_fov_xy(const vec2& val)
 
 size_t Testbed::n_params()
 {
-    return m_network ? m_network->n_params() : 0;
+    return frame().m_network ? frame().m_network->n_params() : 0;
 }
 
 size_t Testbed::n_encoding_params()
@@ -4664,12 +4777,12 @@ size_t Testbed::n_encoding_params()
 
 size_t Testbed::first_encoder_param()
 {
-    if (!m_network)
+    if (!frame().m_network)
     {
         return 0;
     }
 
-    auto layer_sizes     = m_network->layer_sizes();
+    auto layer_sizes     = frame().m_network->layer_sizes();
     size_t first_encoder = 0;
     for (auto size : layer_sizes)
     {
@@ -4681,19 +4794,19 @@ size_t Testbed::first_encoder_param()
 
 uint32_t Testbed::network_width(uint32_t layer) const
 {
-    return m_network ? m_network->width(layer) : 0;
+    return frame().m_network ? frame().m_network->width(layer) : 0;
 }
 
 uint32_t Testbed::network_num_forward_activations() const
 {
-    return m_network ? m_network->num_forward_activations() : 0;
+    return frame().m_network ? frame().m_network->num_forward_activations() : 0;
 }
 
 void Testbed::set_max_level(float maxlevel)
 {
-    if (!m_network)
+    if (!m_current_per_frame_data || !frame().m_network)
         return;
-    auto hg_enc = dynamic_cast<GridEncoding<network_precision_t>*>(m_encoding.get());
+    auto hg_enc = dynamic_cast<GridEncoding<network_precision_t>*>(frame().m_encoding.get());
     if (hg_enc)
     {
         hg_enc->set_max_level(maxlevel);
@@ -4760,6 +4873,8 @@ Testbed::NetworkDims Testbed::network_dims() const
 
 void Testbed::reset_network(bool clear_density_grid)
 {
+    auto& m_nerf = nerf();
+
     m_sdf.iou_decay = 0;
 
     m_rng = default_rng_t{m_seed};
@@ -4790,7 +4905,7 @@ void Testbed::reset_network(bool clear_density_grid)
     m_loss_graph_samples = 0;
 
     // Default config
-    json config = m_network_config;
+    json config = frame().m_network_config;
 
     // If the network config is incomplete, avoid doing further work.
     if (config.is_null())
@@ -4870,8 +4985,8 @@ void Testbed::reset_network(bool clear_density_grid)
                      << " F=" << m_n_features_per_level << " T=2^" << log2_hashmap_size << " L=" << m_n_levels;
     }
 
-    m_loss.reset(create_loss<network_precision_t>(loss_config));
-    m_optimizer.reset(create_optimizer<network_precision_t>(optimizer_config));
+    frame().m_loss.reset(create_loss<network_precision_t>(loss_config));
+    frame().m_optimizer.reset(create_optimizer<network_precision_t>(optimizer_config));
 
     size_t n_encoding_params = 0;
     if (m_testbed_mode == ETestbedMode::Nerf)
@@ -4903,19 +5018,19 @@ void Testbed::reset_network(bool clear_density_grid)
                 rgb_network_config));
         }
 
-        m_network = m_nerf_network = primary_device().nerf_network();
+        frame().m_network = frame().m_nerf_network = primary_device().nerf_network();
 
-        m_encoding        = m_nerf_network->pos_encoding();
-        n_encoding_params = m_encoding->n_params() + m_nerf_network->dir_encoding()->n_params();
+        frame().m_encoding = frame().m_nerf_network->pos_encoding();
+        n_encoding_params  = frame().m_encoding->n_params() + frame().m_nerf_network->dir_encoding()->n_params();
 
         tlog::info() << "Density model: " << dims.n_pos << "--[" << std::string(encoding_config["otype"]) << "]-->"
-                     << m_nerf_network->pos_encoding()->padded_output_width() << "--["
+                     << frame().m_nerf_network->pos_encoding()->padded_output_width() << "--["
                      << std::string(network_config["otype"]) << "(neurons=" << (int) network_config["n_neurons"]
                      << ",layers=" << ((int) network_config["n_hidden_layers"] + 2) << ")"
                      << "]-->" << 1;
 
         tlog::info() << "Color model:   " << n_dir_dims << "--[" << std::string(dir_encoding_config["otype"]) << "]-->"
-                     << m_nerf_network->dir_encoding()->padded_output_width() << "+"
+                     << frame().m_nerf_network->dir_encoding()->padded_output_width() << "+"
                      << network_config.value("n_output_dims", 16u) << "--[" << std::string(rgb_network_config["otype"])
                      << "(neurons=" << (int) rgb_network_config["n_neurons"]
                      << ",layers=" << ((int) rgb_network_config["n_hidden_layers"] + 2) << ")"
@@ -4928,16 +5043,16 @@ void Testbed::reset_network(bool clear_density_grid)
                     ? config["distortion_map"]["optimizer"]
                     : optimizer_config;
 
-            m_distortion.resolution = ivec2(32);
+            frame().m_distortion.resolution = ivec2(32);
             if (config.contains("distortion_map") && config["distortion_map"].contains("resolution"))
             {
-                from_json(config["distortion_map"]["resolution"], m_distortion.resolution);
+                from_json(config["distortion_map"]["resolution"], frame().m_distortion.resolution);
             }
-            m_distortion.map = std::make_shared<TrainableBuffer<2, 2, float>>(m_distortion.resolution);
-            m_distortion.optimizer.reset(create_optimizer<float>(distortion_map_optimizer_config));
-            m_distortion.trainer =
-                std::make_shared<Trainer<float, float>>(m_distortion.map,
-                                                        m_distortion.optimizer,
+            frame().m_distortion.map = std::make_shared<TrainableBuffer<2, 2, float>>(frame().m_distortion.resolution);
+            frame().m_distortion.optimizer.reset(create_optimizer<float>(distortion_map_optimizer_config));
+            frame().m_distortion.trainer =
+                std::make_shared<Trainer<float, float>>(frame().m_distortion.map,
+					frame().m_distortion.optimizer,
                                                         std::shared_ptr<Loss<float>>{create_loss<float>(loss_config)},
                                                         m_seed);
         }
@@ -4965,7 +5080,7 @@ void Testbed::reset_network(bool clear_density_grid)
                 m_sdf.brick_data.free_memory();
             }
 
-            m_encoding.reset(new TakikawaEncoding<network_precision_t>(
+            frame().m_encoding.reset(new TakikawaEncoding<network_precision_t>(
                 encoding_config["starting_level"],
                 m_sdf.triangle_octree,
                 string_to_interpolation_type(encoding_config.value("interpolation", "linear"))));
@@ -4974,7 +5089,7 @@ void Testbed::reset_network(bool clear_density_grid)
         }
         else
         {
-            m_encoding.reset(create_encoding<network_precision_t>(dims.n_input, encoding_config));
+            frame().m_encoding.reset(create_encoding<network_precision_t>(dims.n_input, encoding_config));
 
             m_sdf.uses_takikawa_encoding = false;
             if (m_sdf.octree_depth_target == 0 && encoding_config.contains("n_levels"))
@@ -4986,27 +5101,27 @@ void Testbed::reset_network(bool clear_density_grid)
         for (auto& device : m_devices)
         {
             device.set_network(std::make_shared<NetworkWithInputEncoding<network_precision_t>>(
-                m_encoding, dims.n_output, network_config));
+                frame().m_encoding, dims.n_output, network_config));
         }
 
-        m_network = primary_device().network();
+        frame().m_network = primary_device().network();
 
-        n_encoding_params = m_encoding->n_params();
+        n_encoding_params = frame().m_encoding->n_params();
 
         tlog::info() << "Model:         " << dims.n_input << "--[" << std::string(encoding_config["otype"]) << "]-->"
-                     << m_encoding->padded_output_width() << "--[" << std::string(network_config["otype"])
+                     << frame().m_encoding->padded_output_width() << "--[" << std::string(network_config["otype"])
                      << "(neurons=" << (int) network_config["n_neurons"]
                      << ",layers=" << ((int) network_config["n_hidden_layers"] + 2) << ")"
                      << "]-->" << dims.n_output;
     }
 
-    size_t n_network_params = m_network->n_params() - n_encoding_params;
+    size_t n_network_params = frame().m_network->n_params() - n_encoding_params;
 
     tlog::info() << "  total_encoding_params=" << n_encoding_params << " total_network_params=" << n_network_params;
 
-    m_trainer = std::make_shared<Trainer<float, network_precision_t, network_precision_t>>(
-        m_network, m_optimizer, m_loss, m_seed);
-    m_training_step             = 0;
+    frame().m_trainer = std::make_shared<Trainer<float, network_precision_t, network_precision_t>>(
+        frame().m_network, frame().m_optimizer, frame().m_loss, m_seed);
+    frame().m_training_step             = 0;
     m_training_start_time_point = std::chrono::steady_clock::now();
 
     // Create envmap model
@@ -5017,21 +5132,21 @@ void Testbed::reset_network(bool clear_density_grid)
                                             ? config["envmap"]["optimizer"]
                                             : optimizer_config;
 
-        m_envmap.loss_type = string_to_loss_type(envmap_loss_config.value("otype", "L2"));
+        frame().m_envmap.loss_type = string_to_loss_type(envmap_loss_config.value("otype", "L2"));
 
-        m_envmap.resolution = m_nerf.training.dataset.envmap_resolution;
-        m_envmap.envmap     = std::make_shared<TrainableBuffer<4, 2, float>>(m_envmap.resolution);
-        m_envmap.optimizer.reset(create_optimizer<float>(envmap_optimizer_config));
-        m_envmap.trainer = std::make_shared<Trainer<float, float, float>>(
-            m_envmap.envmap,
-            m_envmap.optimizer,
+        frame().m_envmap.resolution = m_nerf.training.dataset.envmap_resolution;
+        frame().m_envmap.envmap     = std::make_shared<TrainableBuffer<4, 2, float>>(frame().m_envmap.resolution);
+        frame().m_envmap.optimizer.reset(create_optimizer<float>(envmap_optimizer_config));
+        frame().m_envmap.trainer = std::make_shared<Trainer<float, float, float>>(
+            frame().m_envmap.envmap,
+            frame().m_envmap.optimizer,
             std::shared_ptr<Loss<float>>{create_loss<float>(envmap_loss_config)},
             m_seed);
 
         if (m_nerf.training.dataset.envmap_data.data())
         {
-            m_envmap.trainer->set_params_full_precision(m_nerf.training.dataset.envmap_data.data(),
-                                                        m_nerf.training.dataset.envmap_data.size());
+            frame().m_envmap.trainer->set_params_full_precision(m_nerf.training.dataset.envmap_data.data(),
+                                                                m_nerf.training.dataset.envmap_data.size());
         }
     }
 
@@ -5135,7 +5250,7 @@ Testbed::Testbed(ETestbedMode mode)
                             << "]";
         }
     }
-
+    /*
     m_network_config = {
         {"loss", {{"otype", "L2"}}},
         {"optimizer",
@@ -5164,7 +5279,7 @@ Testbed::Testbed(ETestbedMode mode)
              {"output_activation", "None"},
          }},
     };
-
+	*/
     set_mode(mode);
     set_exposure(0);
     set_max_level(1.f);
@@ -5211,7 +5326,9 @@ bool Testbed::clear_tmp_dir()
 
 void Testbed::train(uint32_t batch_size)
 {
-    if (!m_training_data_available || m_camera_path.rendering)
+    auto& m_nerf = nerf();
+
+    if (!frame().m_training_data_available || m_camera_path.rendering)
     {
         m_train = false;
         return;
@@ -5226,10 +5343,10 @@ void Testbed::train(uint32_t batch_size)
 
     // If we don't have a trainer, as can happen when having loaded training data or changed modes without having
     // explicitly loaded a new neural network.
-    if (!m_trainer)
+    if (!frame().m_trainer)
     {
         reload_network_from_file();
-        if (!m_trainer)
+        if (!frame().m_trainer)
         {
             throw std::runtime_error{"Unable to create a neural network trainer."};
         }
@@ -5253,8 +5370,8 @@ void Testbed::train(uint32_t batch_size)
         reset_accumulation(false, false);
     }
 
-    uint32_t n_prep_to_skip = m_testbed_mode == ETestbedMode::Nerf ? clamp(m_training_step / 16u, 1u, 16u) : 1u;
-    if (m_training_step % n_prep_to_skip == 0)
+    uint32_t n_prep_to_skip = m_testbed_mode == ETestbedMode::Nerf ? clamp(frame().m_training_step / 16u, 1u, 16u) : 1u;
+    if (frame().m_training_step % n_prep_to_skip == 0)
     {
         auto start = std::chrono::steady_clock::now();
         ScopeGuard timing_guard{[&]() {
@@ -5276,16 +5393,16 @@ void Testbed::train(uint32_t batch_size)
     }
 
     // Find leaf optimizer and update its settings
-    json* leaf_optimizer_config = &m_network_config["optimizer"];
+    json* leaf_optimizer_config = &frame().m_network_config["optimizer"];
     while (leaf_optimizer_config->contains("nested"))
     {
         leaf_optimizer_config = &(*leaf_optimizer_config)["nested"];
     }
     (*leaf_optimizer_config)["optimize_matrix_params"]     = m_train_network;
     (*leaf_optimizer_config)["optimize_non_matrix_params"] = m_train_encoding;
-    m_optimizer->update_hyperparams(m_network_config["optimizer"]);
+    frame().m_optimizer->update_hyperparams(frame().m_network_config["optimizer"]);
 
-    bool get_loss_scalar = m_training_step % 16 == 0;
+    bool get_loss_scalar = frame().m_training_step % 16 == 0;
 
     {
         auto start = std::chrono::steady_clock::now();
@@ -5599,7 +5716,7 @@ void Testbed::render_frame_main(CudaDevice& device,
 {
     device.render_buffer_view().clear(device.stream());
 
-    if (!m_network)
+    if (!frame().m_network)
     {
         return;
     }
@@ -5679,7 +5796,7 @@ void Testbed::render_frame_main(CudaDevice& device,
             n_elements = next_multiple(n_elements, BATCH_SIZE_GRANULARITY);
             GPUMatrix<float> positions_matrix((float*) positions, 3, n_elements);
             GPUMatrix<float, RM> distances_matrix(distances, 1, n_elements);
-            m_network->inference(stream, positions_matrix, distances_matrix);
+            frame().m_network->inference(stream, positions_matrix, distances_matrix);
         };
 
         normals_fun_t normals_fun =
@@ -5690,7 +5807,7 @@ void Testbed::render_frame_main(CudaDevice& device,
             n_elements = next_multiple(n_elements, BATCH_SIZE_GRANULARITY);
             GPUMatrix<float> positions_matrix((float*) positions, 3, n_elements);
             GPUMatrix<float> normals_matrix((float*) normals, 3, n_elements);
-            m_network->input_gradient(stream, 0, positions_matrix, normals_matrix);
+            frame().m_network->input_gradient(stream, 0, positions_matrix, normals_matrix);
         };
 
         render_sdf(device.stream(),
@@ -5733,6 +5850,8 @@ void Testbed::render_frame_epilogue(cudaStream_t stream,
                                     CudaRenderBuffer& render_buffer,
                                     bool to_srgb)
 {
+    auto& m_nerf = nerf();
+
     vec2 focal_length  = calc_focal_length(render_buffer.in_resolution(), relative_focal_length, m_fov_axis, m_zoom);
     vec2 screen_center = render_screen_center(orig_screen_center);
 
@@ -5974,31 +6093,31 @@ Testbed::LevelStats compute_level_stats(const float* params, size_t n_params)
 
 void Testbed::gather_histograms()
 {
-    if (!m_network)
+    if (!frame().m_network)
     {
         return;
     }
 
-    int n_params          = (int) m_network->n_params();
+    int n_params          = (int) frame().m_network->n_params();
     int first_encoder     = first_encoder_param();
     int n_encoding_params = n_params - first_encoder;
 
-    auto hg_enc = dynamic_cast<GridEncoding<network_precision_t>*>(m_encoding.get());
-    if (hg_enc && m_trainer->params())
+    auto hg_enc = dynamic_cast<GridEncoding<network_precision_t>*>(frame().m_encoding.get());
+    if (hg_enc && frame().m_trainer->params())
     {
         std::vector<float> grid(n_encoding_params);
 
-        uint32_t m = m_network->layer_sizes().front().first;
-        uint32_t n = m_network->layer_sizes().front().second;
+        uint32_t m = frame().m_network->layer_sizes().front().first;
+        uint32_t n = frame().m_network->layer_sizes().front().second;
         std::vector<float> first_layer_rm(m * n);
 
         CUDA_CHECK_THROW(cudaMemcpyAsync(grid.data(),
-                                         m_trainer->params() + first_encoder,
+                                         frame().m_trainer->params() + first_encoder,
                                          grid.size() * sizeof(float),
                                          cudaMemcpyDeviceToHost,
                                          m_stream.get()));
         CUDA_CHECK_THROW(cudaMemcpyAsync(first_layer_rm.data(),
-                                         m_trainer->params(),
+                                         frame().m_trainer->params(),
                                          first_layer_rm.size() * sizeof(float),
                                          cudaMemcpyDeviceToHost,
                                          m_stream.get()));
@@ -6040,9 +6159,11 @@ static const size_t SNAPSHOT_FORMAT_VERSION = 1;
 
 void Testbed::save_snapshot(const fs::path& path, bool include_optimizer_state, bool compress)
 {
-    m_network_config["snapshot"] = m_trainer->serialize(include_optimizer_state);
+    auto& m_nerf = nerf();
 
-    auto& snapshot      = m_network_config["snapshot"];
+    frame().m_network_config["snapshot"] = frame().m_trainer->serialize(include_optimizer_state);
+
+    auto& snapshot      = frame().m_network_config["snapshot"];
     snapshot["version"] = SNAPSHOT_FORMAT_VERSION;
     snapshot["mode"]    = to_string(m_testbed_mode);
 
@@ -6064,8 +6185,8 @@ void Testbed::save_snapshot(const fs::path& path, bool include_optimizer_state, 
         snapshot["nerf"]["extra_dims_opt"] = m_nerf.training.extra_dims_opt;
     }
 
-    snapshot["training_step"]        = m_training_step;
-    snapshot["loss"]                 = m_loss_scalar.val();
+    snapshot["training_step"]        = frame().m_training_step;
+    snapshot["loss"]                 = frame().m_loss_scalar.val();
     snapshot["aabb"]                 = m_aabb;
     snapshot["bounding_radius"]      = m_bounding_radius;
     snapshot["render_aabb_to_local"] = m_render_aabb_to_local;
@@ -6102,11 +6223,15 @@ void Testbed::save_snapshot(const fs::path& path, bool include_optimizer_state, 
     {
         // zstr::ofstream applies zlib compression.
         zstr::ostream zf{f, zstr::default_buff_size, compress ? Z_DEFAULT_COMPRESSION : Z_NO_COMPRESSION};
-        json::to_msgpack(m_network_config, zf);
+        json::to_msgpack(frame().m_network_config, zf);
+    }
+    else if (equals_case_insensitive(m_network_config_path.extension(), "ngpjson"))
+    {
+        std::ofstream(m_network_config_path.str()) << frame().m_network_config;
     }
     else
     {
-        json::to_msgpack(m_network_config, f);
+        json::to_msgpack(frame().m_network_config, f);
     }
 
     tlog::success() << "Saved snapshot '" << path.str() << "'";
@@ -6114,6 +6239,8 @@ void Testbed::save_snapshot(const fs::path& path, bool include_optimizer_state, 
 
 void Testbed::load_snapshot(nlohmann::json config)
 {
+    auto& m_nerf = nerf();
+
     const auto& snapshot = config["snapshot"];
     if (snapshot.value("version", 0) < SNAPSHOT_FORMAT_VERSION)
     {
@@ -6135,6 +6262,9 @@ void Testbed::load_snapshot(nlohmann::json config)
             "Unknown snapshot mode. Snapshot must be regenerated with a new version of instant-ngp."};
     }
 
+    // HACK: let's cache these values inside this for testing...
+    // we can assume these are all the same for the sequence!
+
     m_aabb            = snapshot.value("aabb", m_aabb);
     m_bounding_radius = snapshot.value("bounding_radius", m_bounding_radius);
 
@@ -6145,6 +6275,7 @@ void Testbed::load_snapshot(nlohmann::json config)
             throw std::runtime_error{"Incompatible grid size."};
         }
 
+#if 1
         m_nerf.training.counters_rgb.rays_per_batch      = snapshot["nerf"]["rgb"]["rays_per_batch"];
         m_nerf.training.counters_rgb.measured_batch_size = snapshot["nerf"]["rgb"]["measured_batch_size"];
         m_nerf.training.counters_rgb.measured_batch_size_before_compaction =
@@ -6152,6 +6283,7 @@ void Testbed::load_snapshot(nlohmann::json config)
 
         // If we haven't got a nerf dataset loaded, load dataset metadata from the snapshot
         // and render using just that.
+        // this is no image data, but it has all the camera parameters and the image file paths...
         if (m_data_path.empty() && snapshot["nerf"].contains("dataset"))
         {
             m_nerf.training.dataset = snapshot["nerf"]["dataset"];
@@ -6170,8 +6302,13 @@ void Testbed::load_snapshot(nlohmann::json config)
                     "n_extra_learnable_dims", m_nerf.training.dataset.n_extra_learnable_dims);
             }
         }
+#endif
 
+        // This modifies the metadata for each camera in the dataset and uploads to the GPU.
+        // It also allocates and uploads to the GPU, the optimizers for each image in the dataset
         load_nerf_post();
+
+        // now the slower bit... load the buffers...
 
         GPUMemory<__half> density_grid_fp16 = snapshot["density_grid_binary"];
         m_nerf.density_grid.resize(density_grid_fp16.size());
@@ -6230,14 +6367,14 @@ void Testbed::load_snapshot(nlohmann::json config)
     if (snapshot.contains("up_dir"))
         from_json(snapshot.at("up_dir"), m_up_dir);
 
-    m_network_config = std::move(config);
+    frame().m_network_config = std::move(config);
 
     reset_network(false);
 
-    m_training_step = m_network_config["snapshot"]["training_step"];
-    m_loss_scalar.set(m_network_config["snapshot"]["loss"]);
+    frame().m_training_step = frame().m_network_config["snapshot"]["training_step"];
+    frame().m_loss_scalar.set(frame().m_network_config["snapshot"]["loss"]);
 
-    m_trainer->deserialize(m_network_config["snapshot"]);
+    frame().m_trainer->deserialize(frame().m_network_config["snapshot"]);
 
     if (m_testbed_mode == ETestbedMode::Nerf)
     {
@@ -6324,6 +6461,8 @@ void Testbed::CudaDevice::set_nerf_network(const std::shared_ptr<NerfNetwork<net
 
 void Testbed::sync_device(CudaRenderBuffer& render_buffer, Testbed::CudaDevice& device)
 {
+    auto& m_nerf = nerf();
+
     if (!device.dirty())
     {
         return;
@@ -6355,12 +6494,12 @@ void Testbed::sync_device(CudaRenderBuffer& render_buffer, Testbed::CudaDevice& 
 
     device.data().density_grid_bitfield_ptr = device.data().density_grid_bitfield.data();
 
-    if (m_network)
+    if (frame().m_network)
     {
-        device.data().params.resize(m_network->n_params());
+        device.data().params.resize(frame().m_network->n_params());
         CUDA_CHECK_THROW(cudaMemcpyPeerAsync(device.data().params.data(),
                                              device.id(),
-                                             m_network->inference_params(),
+                                             frame().m_network->inference_params(),
                                              active_device,
                                              device.data().params.bytes(),
                                              device.stream()));

@@ -311,6 +311,9 @@ __global__ void accumulate_kernel(ivec2 resolution, vec4* frame_buffer, vec4* ac
 
 	tmp.a = (tmp.a * sample_count + color.a) / (sample_count+1);
 	accumulate_buffer[idx] = tmp;
+
+	// HACK:
+	//accumulate_buffer[idx] = color;
 }
 
 __device__ vec3 tonemap(vec3 x, ETonemapCurve curve) {

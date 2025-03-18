@@ -45,7 +45,6 @@
 
 #include <cuda.h>
 
-
 #if NVPV_USE_OPENVXL
 #include <openvxl/compute/cuda.h>
 #include <openvxl/platform/cuda/cuda.h>
@@ -699,7 +698,7 @@ public:
     void begin_vr_frame_and_handle_vr_input();
     void gather_histograms();
     void draw_gui();
-    bool frame();
+    bool vr_frame();
     bool want_repl();
     void load_image(const fs::path& data_path);
     void load_exr_image(const fs::path& data_path);
@@ -784,7 +783,6 @@ public:
     float m_ground_truth_alpha                        = 1.0f;
 
     bool m_train                   = false;
-    bool m_training_data_available = false;
     bool m_render                  = true;
     int m_max_spp                  = 0;
     ETestbedMode m_testbed_mode    = ETestbedMode::None;
@@ -821,7 +819,7 @@ public:
     float m_bounding_radius = 1;
     float m_exposure        = 0.f;
 
-	float m_depth_threshold = 0.2f;
+    float m_depth_threshold = 0.2f;
 
     ERenderMode m_render_mode          = ERenderMode::Shade;
     EMeshRenderMode m_mesh_render_mode = EMeshRenderMode::VertexNormals;
@@ -1043,7 +1041,129 @@ public:
         void set_rendering_extra_dims_from_training_view(int trainview);
         void set_rendering_extra_dims(const std::vector<float>& vals);
         std::vector<float> get_rendering_extra_dims_cpu() const;
-    } m_nerf;
+    };
+
+    struct TrainableEnvmap
+    {
+        std::shared_ptr<Optimizer<float>> optimizer;
+        std::shared_ptr<TrainableBuffer<4, 2, float>> envmap;
+        std::shared_ptr<Trainer<float, float, float>> trainer;
+
+        ivec2 resolution;
+        ELossType loss_type;
+
+        Buffer2DView<const vec4> inference_view() const
+        {
+            if (!envmap)
+            {
+                return {};
+            }
+
+            return {(const vec4*) envmap->inference_params(), resolution};
+        }
+
+        Buffer2DView<const vec4> view() const
+        {
+            if (!envmap)
+            {
+                return {};
+            }
+
+            return {(const vec4*) envmap->params(), resolution};
+        }
+    };
+
+    struct TrainableDistortionMap
+    {
+        std::shared_ptr<Optimizer<float>> optimizer;
+        std::shared_ptr<TrainableBuffer<2, 2, float>> map;
+        std::shared_ptr<Trainer<float, float, float>> trainer;
+        ivec2 resolution;
+
+        Buffer2DView<const vec2> inference_view() const
+        {
+            if (!map)
+            {
+                return {};
+            }
+
+            return {(const vec2*) map->inference_params(), resolution};
+        }
+
+        Buffer2DView<const vec2> view() const
+        {
+            if (!map)
+            {
+                return {};
+            }
+
+            return {(const vec2*) map->params(), resolution};
+        }
+    };
+
+    std::map<std::string, std::shared_ptr<Nerf>> m_nerf_cache_map;
+    std::shared_ptr<Nerf> m_current_nerf;
+
+    struct PerFrameData
+    {
+        nlohmann::json m_network_config;
+
+        // Network & training stuff
+        std::shared_ptr<Loss<network_precision_t>> m_loss;
+        std::shared_ptr<Optimizer<network_precision_t>> m_optimizer;
+        std::shared_ptr<Encoding<network_precision_t>> m_encoding;
+        std::shared_ptr<Network<float, network_precision_t>> m_network;
+        std::shared_ptr<Trainer<float, network_precision_t, network_precision_t>> m_trainer;
+        TrainableEnvmap m_envmap;
+        TrainableDistortionMap m_distortion;
+        std::shared_ptr<NerfNetwork<network_precision_t>> m_nerf_network;
+
+        bool m_training_data_available = false;
+        uint32_t m_training_step       = 0;
+        Ema m_loss_scalar              = {EEmaType::Time, 100};
+
+        void clear()
+        {
+            m_encoding                = {};
+            m_loss                    = {};
+            m_network                 = {};
+            m_nerf_network            = {};
+            m_optimizer               = {};
+            m_trainer                 = {};
+            m_envmap                  = {};
+            m_distortion              = {};
+            m_training_data_available = false;
+        }
+    };
+
+    std::map<std::string, std::shared_ptr<PerFrameData>> m_per_frame_cache_map;
+    std::shared_ptr<PerFrameData> m_current_per_frame_data;
+
+    bool acquire_nerf(const std::string& key);
+
+    PerFrameData& frame()
+    {
+        assert(m_current_per_frame_data);
+        return *m_current_per_frame_data.get();
+    }
+
+    const PerFrameData& frame() const
+    {
+        assert(m_current_per_frame_data);
+        return *m_current_per_frame_data.get();
+    }
+
+    Nerf& nerf()
+    {
+        assert(m_current_nerf);
+        return *m_current_nerf.get();
+    }
+
+    const Nerf& nerf() const
+    {
+        assert(m_current_nerf);
+        return *m_current_nerf.get();
+    }
 
     struct Sdf
     {
@@ -1269,9 +1389,7 @@ public:
     float m_histo[257]  = {};
     float m_histo_scale = 1.f;
 
-    uint32_t m_training_step        = 0;
     uint32_t m_training_batch_size  = 1 << 18;
-    Ema m_loss_scalar               = {EEmaType::Time, 100};
     std::vector<float> m_loss_graph = std::vector<float>(256, 0.0f);
     size_t m_loss_graph_samples     = 0;
 
@@ -1462,81 +1580,12 @@ public:
     fs::path m_data_path;
     fs::path m_network_config_path = "base.json";
 
-    nlohmann::json m_network_config;
-
     default_rng_t m_rng;
 
     CudaRenderBuffer m_windowless_render_surface{std::make_shared<CudaSurface2D>()};
 
     uint32_t network_width(uint32_t layer) const;
     uint32_t network_num_forward_activations() const;
-
-    // Network & training stuff
-    std::shared_ptr<Loss<network_precision_t>> m_loss;
-    std::shared_ptr<Optimizer<network_precision_t>> m_optimizer;
-    std::shared_ptr<Encoding<network_precision_t>> m_encoding;
-    std::shared_ptr<Network<float, network_precision_t>> m_network;
-    std::shared_ptr<Trainer<float, network_precision_t, network_precision_t>> m_trainer;
-
-    struct TrainableEnvmap
-    {
-        std::shared_ptr<Optimizer<float>> optimizer;
-        std::shared_ptr<TrainableBuffer<4, 2, float>> envmap;
-        std::shared_ptr<Trainer<float, float, float>> trainer;
-
-        ivec2 resolution;
-        ELossType loss_type;
-
-        Buffer2DView<const vec4> inference_view() const
-        {
-            if (!envmap)
-            {
-                return {};
-            }
-
-            return {(const vec4*) envmap->inference_params(), resolution};
-        }
-
-        Buffer2DView<const vec4> view() const
-        {
-            if (!envmap)
-            {
-                return {};
-            }
-
-            return {(const vec4*) envmap->params(), resolution};
-        }
-    } m_envmap;
-
-    struct TrainableDistortionMap
-    {
-        std::shared_ptr<Optimizer<float>> optimizer;
-        std::shared_ptr<TrainableBuffer<2, 2, float>> map;
-        std::shared_ptr<Trainer<float, float, float>> trainer;
-        ivec2 resolution;
-
-        Buffer2DView<const vec2> inference_view() const
-        {
-            if (!map)
-            {
-                return {};
-            }
-
-            return {(const vec2*) map->inference_params(), resolution};
-        }
-
-        Buffer2DView<const vec2> view() const
-        {
-            if (!map)
-            {
-                return {};
-            }
-
-            return {(const vec2*) map->params(), resolution};
-        }
-    } m_distortion;
-
-    std::shared_ptr<NerfNetwork<network_precision_t>> m_nerf_network;
 };
 
 } // namespace ngp
