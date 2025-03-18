@@ -186,6 +186,7 @@ void Testbed::reload_training_data()
 
 void Testbed::clear_training_data()
 {
+
     auto& m_nerf = nerf();
 
     frame().m_training_data_available = false;
@@ -3953,6 +3954,9 @@ void Testbed::train_and_render(bool skip_rendering)
 //-----------------------------------------------------------------------------------------
 void Testbed::simple_render()
 {
+	if (!m_current_nerf)
+		return;
+
     auto& m_nerf = nerf();
 
     auto smoothed_camera_backup = m_smoothed_camera;
